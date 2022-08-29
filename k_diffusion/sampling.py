@@ -160,17 +160,17 @@ def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, 
             d_2 = to_d(x_2, sigmas[i + 1], denoised_2, clone_please=True)
             d_prime = (d + d_2) / 2
             x = x + d_prime * dt
-        if callable(postprocess_step):
-            x = postprocess_step(x)
-        # print(f'step {i} finished:')
-        # quantiles = torch.quantile(
-        #     rearrange(x, 'b ... -> b (...)').abs().contiguous().cpu(),
-        #     torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], device='cpu'),
-        #     dim = -1,
-        # )
-        # print(quantiles)
-        # print(f'min: {x.min()}')
-        # print(f'max: {x.max()}')
+        # if callable(postprocess_step):
+        #     x = postprocess_step(x)
+        print(f'step {i} finished:')
+        quantiles = torch.quantile(
+            rearrange(x, 'b ... -> b (...)').abs().contiguous().cpu(),
+            torch.tensor([0.0, 0.25, 0.5, 0.75, 0.8, 0.9, 1.0], device='cpu'),
+            dim = -1,
+        )
+        print(quantiles)
+        print('min: %.2f' % x.min())
+        print('max: %.2f' % x.max())
         # print(x)
     return x
 
