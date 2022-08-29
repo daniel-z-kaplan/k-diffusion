@@ -4,12 +4,16 @@ from numpy.typing import _ArrayLikeFloat_co
 
 from scipy import integrate
 import torch
+from torch import Tensor
 from torchdiffeq import odeint
 from tqdm.auto import trange, tqdm
-from typing import Optional
+from typing import Optional, Callable, TypeAlias
+from functools import partial
+from einops import rearrange
 
 from . import utils
 
+TensorOperator: TypeAlias = Callable[[Tensor], Tensor]
 
 def append_zero(x):
     return torch.cat([x, x.new_zeros([1])])
@@ -54,9 +58,39 @@ def get_ancestral_step(sigma_from, sigma_to):
     sigma_down = (sigma_to ** 2 - sigma_up ** 2) ** 0.5
     return sigma_down, sigma_up
 
+# https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L127
+# from lucidrains' imagen_pytorch
+# MIT-licensed
+def _right_pad_dims_to(x: Tensor, t: Tensor) -> Tensor:
+  padding_dims = x.ndim - t.ndim
+  if padding_dims <= 0:
+    return t
+  return t.view(*t.shape, *((1,) * padding_dims))
+
+def _apply_dynamic_threshold(threshold_percentile: int, x: Tensor) -> Tensor:
+    # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
+    # adapted from lucidrains' imagen_pytorch (MIT-licensed)
+    # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
+    flattened = rearrange(x, 'b ... -> b (...)').abs()
+
+    # aten::sort.values_stable not implemented on MPS backend
+    flattened = flattened.contiguous().cpu() if flattened.device.type == 'mps' else flattened
+
+    s = torch.quantile(
+        flattened,
+        threshold_percentile,
+        dim = -1,
+    ).item()
+
+    s = max(1., s)
+
+    return x.clamp(-s, s) / s
+
+def make_dynamic_thresholder(threshold_percentile: int = 0.9) -> TensorOperator:
+    return partial(_apply_dynamic_threshold, threshold_percentile)
 
 @torch.no_grad()
-def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1., quanta: Optional[_ArrayLikeFloat_co]=None):
+def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1., quanta: Optional[_ArrayLikeFloat_co]=None, postprocess_step: Optional[TensorOperator]=None):
     """Implements Algorithm 2 (Euler steps) from Karras et al. (2022)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
@@ -74,11 +108,13 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
         dt = sigmas[i + 1] - sigma_hat
         # Euler method
         x = x + d * dt
+        if callable(postprocess_step):
+            x = postprocess_step(x)
     return x
 
 
 @torch.no_grad()
-def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None):
+def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None, postprocess_step: Optional[TensorOperator]=None):
     """Ancestral sampling with Euler method steps."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
@@ -92,11 +128,13 @@ def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, dis
         dt = sigma_down - sigmas[i]
         x = x + d * dt
         x = x + torch.randn_like(x) * sigma_up
+        if callable(postprocess_step):
+            x = postprocess_step(x)
     return x
 
 
 @torch.no_grad()
-def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1., quanta: Optional[_ArrayLikeFloat_co]=None):
+def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1., quanta: Optional[_ArrayLikeFloat_co]=None, postprocess_step: Optional[TensorOperator]=None):
     """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
@@ -122,11 +160,23 @@ def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, 
             d_2 = to_d(x_2, sigmas[i + 1], denoised_2, clone_please=True)
             d_prime = (d + d_2) / 2
             x = x + d_prime * dt
+        if callable(postprocess_step):
+            x = postprocess_step(x)
+        # print(f'step {i} finished:')
+        # quantiles = torch.quantile(
+        #     rearrange(x, 'b ... -> b (...)').abs().contiguous().cpu(),
+        #     torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], device='cpu'),
+        #     dim = -1,
+        # )
+        # print(quantiles)
+        # print(f'min: {x.min()}')
+        # print(f'max: {x.max()}')
+        # print(x)
     return x
 
 
 @torch.no_grad()
-def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1., quanta: Optional[_ArrayLikeFloat_co]=None):
+def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1., quanta: Optional[_ArrayLikeFloat_co]=None, postprocess_step: Optional[TensorOperator]=None):
     """A sampler inspired by DPM-Solver-2 and Algorithm 2 from Karras et al. (2022)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
@@ -149,11 +199,13 @@ def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None,
         denoised_2 = model(x_2, sigma_mid * s_in, **extra_args)
         d_2 = to_d(x_2, sigma_mid, denoised_2)
         x = x + d_2 * dt_2
+        if callable(postprocess_step):
+            x = postprocess_step(x)
     return x
 
 
 @torch.no_grad()
-def sample_dpm_2_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None):
+def sample_dpm_2_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None, postprocess_step: Optional[TensorOperator]=None):
     """Ancestral sampling with DPM-Solver inspired second-order steps."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
@@ -172,6 +224,8 @@ def sample_dpm_2_ancestral(model, x, sigmas, extra_args=None, callback=None, dis
         d_2 = to_d(x_2, sigma_mid, denoised_2)
         x = x + d_2 * dt_2
         x = x + torch.randn_like(x) * sigma_up
+        if callable(postprocess_step):
+            x = postprocess_step(x)
     return x
 
 
@@ -189,7 +243,7 @@ def linear_multistep_coeff(order, t, i, j):
 
 
 @torch.no_grad()
-def sample_lms(model, x, sigmas, extra_args=None, callback=None, disable=None, order=4):
+def sample_lms(model, x, sigmas, extra_args=None, callback=None, disable=None, order=4, postprocess_step: Optional[TensorOperator]=None):
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     ds = []
@@ -204,6 +258,8 @@ def sample_lms(model, x, sigmas, extra_args=None, callback=None, disable=None, o
         cur_order = min(i + 1, order)
         coeffs = [linear_multistep_coeff(cur_order, sigmas.cpu(), i, j) for j in range(cur_order)]
         x = x + sum(coeff * d for coeff, d in zip(coeffs, reversed(ds)))
+        if callable(postprocess_step):
+            x = postprocess_step(x)
     return x
 
 
