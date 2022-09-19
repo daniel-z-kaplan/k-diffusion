@@ -2,6 +2,7 @@ import math
 
 import torch
 from torch import nn
+from torch.profiler import record_function
 
 from . import sampling, utils
 
@@ -111,9 +112,13 @@ class DiscreteEpsDDPMDenoiser(DiscreteSchedule):
         return (eps - noise).pow(2).flatten(1).mean(1)
 
     def forward(self, input, sigma, **kwargs):
-        c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
-        eps = self.get_eps(input * c_in, self.sigma_to_t(sigma), **kwargs)
-        return input + eps * c_out
+        with record_function("kdiff_eps::forward"):
+            with record_function("kdiff_eps::c_out, c_in"):
+                c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
+            with record_function("kdiff_eps::get_eps*("):
+                eps = self.get_eps(input * c_in, self.sigma_to_t(sigma), **kwargs)
+            with record_function("kdiff_eps::+*"):
+                return input + eps * c_out
 
 
 class OpenAIDenoiser(DiscreteEpsDDPMDenoiser):

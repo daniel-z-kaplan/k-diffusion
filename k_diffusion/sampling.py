@@ -4,6 +4,7 @@ from scipy import integrate
 import torch
 from torchdiffeq import odeint
 from tqdm.auto import trange, tqdm
+from torch.profiler import record_function
 
 from . import utils
 
@@ -90,28 +91,40 @@ def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, dis
 def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
     """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)."""
     extra_args = {} if extra_args is None else extra_args
-    s_in = x.new_ones([x.shape[0]])
-    for i in trange(len(sigmas) - 1, disable=disable):
-        gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
-        eps = torch.randn_like(x) * s_noise
-        sigma_hat = sigmas[i] * (gamma + 1)
-        if gamma > 0:
-            x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
-        denoised = model(x, sigma_hat * s_in, **extra_args)
-        d = to_d(x, sigma_hat, denoised)
-        if callback is not None:
-            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigma_hat, 'denoised': denoised})
-        dt = sigmas[i + 1] - sigma_hat
-        if sigmas[i + 1] == 0:
-            # Euler method
-            x = x + d * dt
-        else:
-            # Heun's method
-            x_2 = x + d * dt
-            denoised_2 = model(x_2, sigmas[i + 1] * s_in, **extra_args)
-            d_2 = to_d(x_2, sigmas[i + 1], denoised_2)
-            d_prime = (d + d_2) / 2
-            x = x + d_prime * dt
+    with record_function("sample_heun::new_ones"):
+        s_in = x.new_ones([x.shape[0]])
+    with record_function("sample_heun::loop"):
+        for i in trange(len(sigmas) - 1, disable=disable):
+            with record_function("sample_heun::iter"):
+                gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
+                with record_function("sample_heun::eps"):
+                    eps = torch.randn_like(x) * s_noise
+                sigma_hat = sigmas[i] * (gamma + 1)
+                if gamma > 0:
+                    x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
+                with record_function("sample_heun::denoised=model()"):
+                    denoised = model(x, sigma_hat * s_in, **extra_args)
+                with record_function("sample_heun::d = to_d()"):
+                    d = to_d(x, sigma_hat, denoised)
+                if callback is not None:
+                    callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigma_hat, 'denoised': denoised})
+                with record_function("sample_heun::dt"):
+                    dt = sigmas[i + 1] - sigma_hat
+                with record_function("sample_heun::solve"):
+                    if sigmas[i + 1] == 0:
+                        with record_function("sample_heun::euler"):
+                            # Euler method
+                            x = x + d * dt
+                    else:
+                        with record_function("sample_heun::heun"):
+                            # Heun's method
+                            x_2 = x + d * dt
+                            with record_function("sample_heun::heun::denoised_2 = model()"):
+                                denoised_2 = model(x_2, sigmas[i + 1] * s_in, **extra_args)
+                            with record_function("sample_heun::d_2 = to_d()"):
+                                d_2 = to_d(x_2, sigmas[i + 1], denoised_2)
+                            d_prime = (d + d_2) / 2
+                            x = x + d_prime * dt
     return x
 
 
