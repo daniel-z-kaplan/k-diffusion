@@ -18,6 +18,7 @@ setup(
         'scipy',
         'torch',
         'torchdiffeq',
+        'torchsde',
         'torchvision',
         'tqdm',
         'wandb',
