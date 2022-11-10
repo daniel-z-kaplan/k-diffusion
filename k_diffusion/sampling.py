@@ -541,7 +541,14 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
             callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
         h = t_next - t
-        if old_denoised is None or sigmas[i + 1] == 0:
+        if old_denoised is None:
+            r = 1 / 2
+            h = t_next - t
+            s = t + r * h
+            x_2 = (sigma_fn(s) / sigma_fn(t)) * x - (-h * r).expm1() * denoised
+            denoised_2 = model(x_2, sigma_fn(s) * s_in, **extra_args)
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_2
+        elif sigmas[i + 1] == 0:
             x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
         else:
             h_last = t - t_fn(sigmas[i - 1])
