@@ -587,7 +587,9 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     sigma_fn = lambda t: t.neg().exp()
-    t_fn = lambda sigma: sigma.log().neg()
+    t_fn = lambda sigma: (
+        sigma.detach().clone() if sigma.device.type == 'mps' and torch.__version__ == '1.12.1' else sigma
+    ).log().neg()
     old_denoised = None
 
     for i in trange(len(sigmas) - 1, disable=disable):
