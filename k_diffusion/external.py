@@ -6,14 +6,13 @@ from typing import Protocol, Generic, TypeVar, TYPE_CHECKING
 
 from . import sampling, utils
 
+class AbstractModel(Protocol):
+  def __call__(self, *args, **kwargs) -> Tensor: ...
 
-class Model(Protocol):
-    def __call__(self, *args, **kwargs) -> Tensor: ...
+class DenoiserModel(AbstractModel):
+    def __call__(self, x: Tensor, t: Tensor, *args, **kwargs) -> Tensor: ...
 
-class DenoiserModel(Model):
-    def __call__(self, noised_input: Tensor, t: Tensor, **kwargs) -> Tensor: ...
-
-class CompVisModel(Model):
+class CompVisModel(AbstractModel):
     alphas_cumprod: Tensor
     def apply_model(self, x: Tensor, t: Tensor, cond: Tensor) -> Tensor: ...
 
@@ -21,11 +20,11 @@ class CompVisModel(Model):
 # at compile-time by some type-checkers
 # https://github.com/python/mypy/issues/4236#issuecomment-344660299
 if TYPE_CHECKING:
-    TModel = TypeVar('TModel', bound=Model, default=Model)
+    TModel = TypeVar('TModel', bound=AbstractModel, default=AbstractModel)
     TDenoiserModel = TypeVar('TDenoiserModel', bound=DenoiserModel, default=DenoiserModel)
     TCompVisModel = TypeVar('TCompVisModel', bound=CompVisModel, default=CompVisModel)
 else:
-    TModel = TypeVar('TModel', bound=Model)
+    TModel = TypeVar('TModel', bound=AbstractModel)
     TDenoiserModel = TypeVar('TDenoiserModel', bound=DenoiserModel)
     TCompVisModel = TypeVar('TCompVisModel', bound=CompVisModel)
 
@@ -50,6 +49,15 @@ class BaseModelWrapper(nn.Module, Generic[TModel]):
 
     def forward(self, *args, **kwargs):
         return self.inner_model(*args, **kwargs)
+    
+    def sigma_to_t(self, sigma: Tensor) -> Tensor:
+        return sigma
+    
+    def t_to_sigma(self, t: Tensor) -> Tensor:
+        return t
+    
+    def discretize_sigma(self, sigma: Tensor) -> Tensor:
+        return self.t_to_sigma(self.sigma_to_t(sigma))
 
 
 class VDenoiser(BaseModelWrapper[TDenoiserModel]):
