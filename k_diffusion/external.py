@@ -16,6 +16,11 @@ class CompVisModel(AbstractModel):
     alphas_cumprod: Tensor
     def apply_model(self, x: Tensor, t: Tensor, cond: Tensor) -> Tensor: ...
 
+class WrappedModelProto(AbstractModel):
+    def sigma_to_t(self, sigma: Tensor) -> Tensor: ...
+    def t_to_sigma(self, t: Tensor) -> Tensor: ...
+    def discretize_sigma(self, sigma: Tensor) -> Tensor: ...
+
 # the 'default' arg of TypeVar isn't valid at runtime, but amazingly seems to be utilised
 # at compile-time by some type-checkers
 # https://github.com/python/mypy/issues/4236#issuecomment-344660299
@@ -28,7 +33,7 @@ else:
     TDenoiserModel = TypeVar('TDenoiserModel', bound=DenoiserModel)
     TCompVisModel = TypeVar('TCompVisModel', bound=CompVisModel)
 
-class BaseModelWrapper(nn.Module, Generic[TModel]):
+class BaseModelWrapper(nn.Module, WrappedModelProto, Generic[TModel]):
     inner_model: TModel
 
     """The base wrapper class for the k-diffusion model wrapper idiom. Model
