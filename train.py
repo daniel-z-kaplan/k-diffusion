@@ -147,6 +147,8 @@ def main():
         log_config['config'] = config
         log_config['parameters'] = K.utils.n_params(inner_model)
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group, config=log_config, save_code=True)
+    
+    inner_model, inner_model_ema = accelerator.prepare(inner_model, inner_model_ema)
 
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
@@ -236,7 +238,7 @@ def main():
     train_dl = data.DataLoader(train_set, args.batch_size, shuffle=True, drop_last=True,
                                num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
 
-    inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+    opt, train_dl = accelerator.prepare(opt, train_dl)
     if use_wandb:
         wandb.watch(inner_model)
     if accelerator.num_processes == 1:
