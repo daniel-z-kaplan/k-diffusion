@@ -6,7 +6,7 @@
       "request": "launch",
       "program": "train.py",
       "console": "integratedTerminal",
-      "justMyCode": true,
+      "justMyCode": false,
       "args": [
         "--config",
         "configs/config_oxford_flowers_shifted_window.json",
@@ -24,7 +24,7 @@
       "request": "launch",
       "program": "train.py",
       "console": "integratedTerminal",
-      "justMyCode": true,
+      "justMyCode": false,
       "args": [
         "--config",
         "configs/config_oxford_flowers.json",
@@ -91,7 +91,7 @@
       "request": "launch",
       "program": "train.py",
       "console": "integratedTerminal",
-      "justMyCode": true,
+      "justMyCode": false,
       "args": [
         "--config",
         "configs/config_oxford_flowers_crossattn.json",
@@ -110,7 +110,7 @@
       "request": "launch",
       "module": "accelerate.commands.launch",
       "console": "integratedTerminal",
-      "justMyCode": true,
+      "justMyCode": false,
       "args": [
         "train.py",
         "--config",
