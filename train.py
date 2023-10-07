@@ -19,13 +19,14 @@ from torch import distributed as dist
 from torch.distributed import Work
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim, LongTensor, FloatTensor, inference_mode
+from torch import optim, LongTensor, FloatTensor, BoolTensor, inference_mode
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
-from typing import List
+from typing import List, Optional
 
 import k_diffusion as K
+from k_diffusion.utils import DataSetTransform, BatchData
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -157,11 +158,15 @@ def main():
     groups = inner_model.param_groups(lr)
     inner_model, inner_model_ema = accelerator.prepare(inner_model, inner_model_ema)
 
+    text_embeds: Optional[FloatTensor] = None
+    token_mask: Optional[BoolTensor] = None
+    text_uncond_ix = 0
     if 'classes_to_captions' in dataset_config:
         assert dataset_config['classes_to_captions'] == 'oxford-flowers'
         from transformers import CLIPTextConfig
         from dataset_meta.oxford_flowers import flower_classes
-        class_captions: List[str] = flower_classes
+        uncond = ''
+        class_captions: List[str] = [uncond, *flower_classes]
         
         text_model_name = 'openai/clip-vit-large-patch14'
         text_config: CLIPTextConfig = CLIPTextConfig.from_pretrained(text_model_name)
@@ -298,7 +303,28 @@ def main():
     elif dataset_config['type'] == 'huggingface':
         from datasets import load_dataset
         train_set = load_dataset(dataset_config['location'])
-        train_set.set_transform(partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key']))
+        ds_transforms: List[DataSetTransform] = []
+        if 'cross_attns' in model_config and model_config['cross_attns']:
+            if 'classes_to_captions' in dataset_config:
+                assert dataset_config['classes_to_captions'] == 'oxford-flowers'
+                from dataset_meta.oxford_flowers import ordinal_to_lexical
+                def embed_ix_extractor(batch: BatchData) -> BatchData:
+                    labels_ordinal: List[int] = batch['label']
+                    # labels_ordinal is 1-indexed.
+                    # the conds in text_embeds happen to be 1-indexed too, because we inserted an uncond embed at index 0
+                    # had we not embedded an uncond at index 0, we would need to adapt labels_ordinal's 1-index to text_embeds' 0-index:
+                    # labels_lexical_zeroix: List[int] = [ordinal_to_lexical[o]-1 for o in labels_ordinal]
+                    labels_lexical: List[int] = [ordinal_to_lexical[o] for o in labels_ordinal]
+                    return { 'embed_ix': labels_lexical }
+                ds_transforms.append(embed_ix_extractor)
+            else:
+                def label_extractor(batch: BatchData) -> BatchData:
+                    return { 'label': batch['label'] }
+                ds_transforms.append(label_extractor)
+        img_augs: DataSetTransform = partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key'])
+        ds_transforms.append(img_augs)
+        multi_transform: DataSetTransform = partial(K.utils.hf_datasets_multi_transform, transforms=ds_transforms)
+        train_set.set_transform(multi_transform)
         train_set = train_set['train']
     elif dataset_config['type'] == 'custom':
         location = (Path(args.config).parent / dataset_config['location']).resolve()
@@ -522,7 +548,13 @@ def main():
                 with accelerator.accumulate(model):
                     reals, _, aug_cond = batch[image_key]
                     class_cond, extra_args = None, {}
-                    if num_classes:
+                    if text_embeds is not None:
+                        drop = torch.rand(batch['embed_ix'].shape[0], device=accelerator.device)
+                        batch_text_embeds: FloatTensor = text_embeds.index_select(0, batch['embed_ix'])
+                        batch_text_embeds[drop < cond_dropout_rate] = text_embeds[text_uncond_ix]
+                        batch_text_embeds[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 0
+                        extra_args['crossattn_cond'] = batch_text_embeds
+                    elif num_classes:
                         class_cond = batch[class_key]
                         drop = torch.rand(class_cond.shape, device=class_cond.device)
                         class_cond.masked_fill_(drop < cond_dropout_rate, num_classes)
