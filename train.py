@@ -393,28 +393,33 @@ def main():
         filename = f'{args.name}_{step:08}.pth'
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
-        inner_model = unwrap(model.inner_model)
-        inner_model_ema = unwrap(model_ema.inner_model)
-        obj = {
-            'config': config,
-            'model': inner_model.state_dict(),
-            'model_ema': inner_model_ema.state_dict(),
-            'opt': opt.state_dict(),
-            'sched': sched.state_dict(),
-            'ema_sched': ema_sched.state_dict(),
-            'epoch': epoch,
-            'step': step,
-            'gns_stats': gns_stats.state_dict() if gns_stats is not None else None,
-            'ema_stats': ema_stats,
-            'demo_gen': demo_gen.get_state(),
-            'elapsed': elapsed,
-        }
-        accelerator.save(obj, filename)
-        if accelerator.is_main_process:
-            state_obj = {'latest_checkpoint': filename}
-            json.dump(state_obj, open(state_path, 'w'))
-        if args.wandb_save_model and use_wandb:
-            wandb.save(filename)
+
+        with (
+            FSDP.summon_full_params(model.inner_model, rank0_only=True, offload_to_cpu=True, writeback=False),
+            FSDP.summon_full_params(model_ema.inner_model, rank0_only=True, offload_to_cpu=True, writeback=False),
+        ):
+            inner_model = unwrap(model.inner_model)
+            inner_model_ema = unwrap(model_ema.inner_model)
+            if accelerator.is_main_process:
+                obj = {
+                    'config': config,
+                    'model': inner_model.state_dict(),
+                    'model_ema': inner_model_ema.state_dict(),
+                    'opt': opt.state_dict(),
+                    'sched': sched.state_dict(),
+                    'ema_sched': ema_sched.state_dict(),
+                    'epoch': epoch,
+                    'step': step,
+                    'gns_stats': gns_stats.state_dict() if gns_stats is not None else None,
+                    'ema_stats': ema_stats,
+                    'demo_gen': demo_gen.get_state(),
+                    'elapsed': elapsed,
+                }
+                accelerator.save(obj, filename)
+                state_obj = {'latest_checkpoint': filename}
+                json.dump(state_obj, open(state_path, 'w'))
+                if args.wandb_save_model and use_wandb:
+                    wandb.save(filename)
 
     losses_since_last_print = []
 
