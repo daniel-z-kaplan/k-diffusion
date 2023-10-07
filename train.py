@@ -23,7 +23,7 @@ from torch import optim, LongTensor, FloatTensor, BoolTensor, inference_mode
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
@@ -286,6 +286,8 @@ def main():
                                   max_value=ema_sched_config['max_value'])
     ema_stats = {}
 
+    uses_crossattn: bool = 'cross_attns' in model_config and model_config['cross_attns']
+
     tf = transforms.Compose([
         transforms.Resize(size[0], interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.CenterCrop(size[0]),
@@ -304,7 +306,7 @@ def main():
         from datasets import load_dataset
         train_set = load_dataset(dataset_config['location'])
         ds_transforms: List[DataSetTransform] = []
-        if 'cross_attns' in model_config and model_config['cross_attns']:
+        if uses_crossattn:
             if 'classes_to_captions' in dataset_config:
                 assert dataset_config['classes_to_captions'] == 'oxford-flowers'
                 from dataset_meta.oxford_flowers import ordinal_to_lexical
@@ -431,13 +433,13 @@ def main():
 
     cfg_scale = 1.
 
-    def make_cfg_model_fn(model):
-        def cfg_model_fn(x, sigma, class_cond):
+    def make_cfg_model_fn(model, uncond: FloatTensor, cond_type: Literal['class_cond', 'crossattn_cond']):
+        def cfg_model_fn(x, sigma, cond: FloatTensor):
             x_in = torch.cat([x, x])
             sigma_in = torch.cat([sigma, sigma])
-            class_uncond = torch.full_like(class_cond, num_classes)
-            class_cond_in = torch.cat([class_uncond, class_cond])
-            out = model(x_in, sigma_in, class_cond=class_cond_in)
+            cond_in = torch.cat([uncond, cond])
+            cond_kwargs = { cond_type: cond_in }
+            out = model(x_in, sigma_in, **cond_kwargs)
             out_uncond, out_cond = out.chunk(2)
             return out_uncond + (out_cond - out_uncond) * cfg_scale
         if cfg_scale != 1:
@@ -457,11 +459,21 @@ def main():
         dist.broadcast(x, 0)
         x = x[accelerator.process_index] * sigma_max
         model_fn, extra_args = model_ema, {}
-        if num_classes:
+        if uses_crossattn:
+            # btw 0th item in text_embeds is uncond. we (intentionally) may draw uncond samples.
+            # these will have CFG applied, which is silly but free (in wall-time) since they coexist with batch items that legitimately need CFG
+            caption_ix = torch.randint(0, text_embeds.shape[0], [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
+            dist.broadcast(caption_ix, 0)
+            caption_embed = text_embeds.index_select(0, caption_ix[accelerator.process_index])
+            extra_args['crossattn_cond'] = caption_embed
+            class_uncond = text_embeds[text_uncond_ix].unsqueeze(0)
+            model_fn = make_cfg_model_fn(model_ema, class_uncond, cond_type='crossattn_cond')
+        elif num_classes:
             class_cond = torch.randint(0, num_classes, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(class_cond, 0)
             extra_args['class_cond'] = class_cond[accelerator.process_index]
-            model_fn = make_cfg_model_fn(model_ema)
+            class_uncond = torch.full_like(class_cond, num_classes)
+            model_fn = make_cfg_model_fn(model_ema, class_uncond, cond_type='class_cond')
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
         x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
         x_0 = accelerator.gather(x_0)[:args.sample_n]
