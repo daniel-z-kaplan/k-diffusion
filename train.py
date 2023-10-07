@@ -16,6 +16,7 @@ import safetensors.torch as safetorch
 import torch
 import torch._dynamo
 from torch import distributed as dist
+from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
 from torch import optim
 from torch.utils import data
@@ -147,11 +148,10 @@ def main():
         log_config['config'] = config
         log_config['parameters'] = K.utils.n_params(inner_model)
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group, config=log_config, save_code=True)
-    
-    inner_model, inner_model_ema = accelerator.prepare(inner_model, inner_model_ema)
 
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
+    inner_model, inner_model_ema = accelerator.prepare(inner_model, inner_model_ema)
     if opt_config['type'] == 'adamw':
         opt = optim.AdamW(groups,
                           lr=lr,
@@ -173,6 +173,8 @@ def main():
                         weight_decay=opt_config.get('weight_decay', 0.))
     else:
         raise ValueError('Invalid optimizer type')
+    opt_ema = optim.SGD(inner_model_ema.parameters(), lr=0.0)
+    opt, opt_ema = accelerator.prepare(opt, opt_ema)
 
     if sched_config['type'] == 'inverse':
         sched = K.utils.InverseLR(opt,
@@ -237,8 +239,8 @@ def main():
 
     train_dl = data.DataLoader(train_set, args.batch_size, shuffle=True, drop_last=True,
                                num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+    train_dl = accelerator.prepare(train_dl)
 
-    opt, train_dl = accelerator.prepare(opt, train_dl)
     if use_wandb:
         wandb.watch(inner_model)
     if accelerator.num_processes == 1:
@@ -336,6 +338,8 @@ def main():
     def demo():
         if accelerator.is_main_process:
             tqdm.write('Sampling...')
+        with FSDP.summon_full_params(model_ema):
+            pass
         filename = f'{args.name}_demo_{step:08}.png'
         n_per_proc = math.ceil(args.sample_n / accelerator.num_processes)
         x = torch.randn([accelerator.num_processes, n_per_proc, model_config['input_channels'], size[0], size[1]], generator=demo_gen).to(device)
@@ -363,6 +367,8 @@ def main():
             return
         if accelerator.is_main_process:
             tqdm.write('Evaluating...')
+        with FSDP.summon_full_params(model_ema):
+            pass
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
         def sample_fn(n):
             x = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
