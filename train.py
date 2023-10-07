@@ -16,15 +16,16 @@ import safetensors.torch as safetorch
 import torch
 import torch._dynamo
 from torch import distributed as dist
+from torch.distributed import Work
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim
+from torch import optim, LongTensor, FloatTensor, inference_mode
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
+from typing import List
 
 import k_diffusion as K
-
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -86,6 +87,8 @@ def main():
     p.add_argument('--start-method', type=str, default='spawn',
                    choices=['fork', 'forkserver', 'spawn'],
                    help='the multiprocessing start method')
+    p.add_argument('--text-model-hf-cache-dir', type=str, default=None,
+                   help='disk directory into which HF should download text model checkpoints')
     p.add_argument('--wandb-entity', type=str,
                    help='the wandb entity name')
     p.add_argument('--wandb-group', type=str,
@@ -115,6 +118,7 @@ def main():
     size = model_config['input_size']
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps, mixed_precision=args.mixed_precision)
+
     ensure_distributed()
     device = accelerator.device
     unwrap = accelerator.unwrap_model
@@ -152,6 +156,87 @@ def main():
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
     inner_model, inner_model_ema = accelerator.prepare(inner_model, inner_model_ema)
+
+    if 'classes_to_captions' in dataset_config:
+        assert dataset_config['classes_to_captions'] == 'oxford-flowers'
+        from transformers import CLIPTextConfig
+        from dataset_meta.oxford_flowers import flower_classes
+        class_captions: List[str] = flower_classes
+        
+        text_model_name = 'openai/clip-vit-large-patch14'
+        text_config: CLIPTextConfig = CLIPTextConfig.from_pretrained(text_model_name)
+        max_length: int = text_config.max_position_embeddings
+
+        expected_embed_shape = torch.Size((len(class_captions), max_length, text_config.hidden_size))
+        expected_mask_shape = torch.Size((len(class_captions), max_length))
+
+        match(accelerator.mixed_precision):
+            case 'bf16':
+                embed_dtype = torch.bfloat16
+            case 'fp16':
+                embed_dtype = torch.float16
+            case 'fp8':
+                # seriously?
+                embed_dtype = torch.float8_e4m3fn
+            case _:
+                embed_dtype = torch.float32
+
+        if accelerator.is_main_process:
+            from transformers import CLIPTextModel, CLIPTokenizerFast
+            from transformers.modeling_outputs import BaseModelOutputWithPooling
+            from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, TensorType
+            text_model: CLIPTextModel = CLIPTextModel.from_pretrained(
+                text_model_name,
+                config=text_config,
+                cache_dir=args.text_model_hf_cache_dir,
+                use_safetensors=True,
+                torch_dtype=torch.float16,
+            ).to(accelerator.device).eval()
+            tokenizer: CLIPTokenizerFast = CLIPTokenizerFast.from_pretrained(text_model_name)
+            tokens_out: BatchEncoding = tokenizer(
+                class_captions,
+                return_tensors=TensorType.PYTORCH,
+                padding=PaddingStrategy.MAX_LENGTH,
+                max_length=max_length,
+                return_attention_mask=True,
+                return_length=True,
+                add_special_tokens=True,
+            )
+            use_penult = True
+            tokens: LongTensor = tokens_out['input_ids'].to(accelerator.device)
+            token_mask: LongTensor = tokens_out['attention_mask'].to(accelerator.device, dtype=torch.bool)
+            del tokens_out, tokenizer
+            assert token_mask.shape == expected_mask_shape
+            # https://github.com/openai/CLIP/issues/183
+            # supposedly we shouldn't supply the token mask to CLIPTextEncoder -- OpenAI say
+            # that the causal mask is already enough to protect you from attending to padding?
+            # in fact, I certainly noticed with SDXL that supplying mask to CLIPTextEncoder gave me bad results:
+            # https://github.com/Birch-san/sdxl-play/blob/afabe5d173553511d0fd0d65c34dffb234745e69/src/embed_mgmt/embed.py#L24
+            with inference_mode():
+                encoder_out: BaseModelOutputWithPooling = text_model.forward(
+                    tokens,
+                    # attention_mask=token_mask,
+                    output_hidden_states=use_penult,
+                    return_dict=True,
+                )
+                del tokens
+                if use_penult:
+                    penult: FloatTensor = encoder_out.hidden_states[-2]
+                    normed: FloatTensor = text_model.text_model.final_layer_norm.forward(penult)
+                    text_embeds: FloatTensor = normed.to(embed_dtype)
+                    del penult, normed
+                else:
+                    text_embeds: FloatTensor = encoder_out.last_hidden_state.to(embed_dtype)
+                assert text_embeds.shape == expected_embed_shape
+                del encoder_out, text_model
+        else:
+            text_embeds: FloatTensor = torch.empty(expected_embed_shape, dtype=embed_dtype, device=accelerator.device)
+            token_mask: FloatTensor = torch.empty(expected_mask_shape, dtype=torch.bool, device=accelerator.device)
+        emb_handle: Work = dist.broadcast(text_embeds, 0, async_op=True)
+        mask_handle: Work = dist.broadcast(token_mask, 0, async_op=True)
+        emb_handle.wait()
+        mask_handle.wait()
+
     if opt_config['type'] == 'adamw':
         opt = optim.AdamW(groups,
                           lr=lr,

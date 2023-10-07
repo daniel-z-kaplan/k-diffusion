@@ -25,7 +25,8 @@
   "dataset": {
       "type": "huggingface",
       "location": "nelorth/oxford-flowers",
-      "image_key": "image"
+      "image_key": "image",
+      "classes_to_captions": "oxford-flowers"
   },
   "optimizer": {
       "type": "adamw",
