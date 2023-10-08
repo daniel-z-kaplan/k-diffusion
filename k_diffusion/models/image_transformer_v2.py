@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from functools import lru_cache, reduce
 import math
-from typing import Union, Optional
+from typing import Union, Optional, Iterable
 
 from einops import rearrange
 import torch
@@ -401,8 +401,7 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
     def extra_repr(self):
         return f"d_head={self.d_head}, kernel_size={self.kernel_size}"
 
-    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
-        skip = x
+    def forward(self, x, pos, cond):
         x = self.norm(x, cond)
         qkv = self.qkv_proj(x)
         q, k, v = rearrange(qkv, "n h w (t nh e) -> t n nh h w e", t=3, e=self.d_head)
@@ -418,7 +417,7 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
         x = rearrange(x, "n nh h w e -> n h w (nh e)")
         x = self.dropout(x)
         x = self.out_proj(x)
-        return x + skip
+        return x
 
 
 class ShiftedWindowSelfAttentionBlock(nn.Module):
@@ -454,6 +453,37 @@ class ShiftedWindowSelfAttentionBlock(nn.Module):
         return x + skip
 
 
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, d_model: int, d_cross: int, d_head: int, dropout=0.):
+        super().__init__()
+        self.d_head = d_head
+        self.dropout = dropout
+        self.n_heads = d_model // d_head
+        self.norm = nn.LayerNorm(d_model)
+        self.q_proj = apply_wd(nn.Linear(d_model, d_model, bias=False))
+        self.kv_proj = apply_wd(nn.Linear(d_cross, d_model * 2, bias=False))
+        self.dropout = nn.Dropout(dropout)
+        self.out_proj = apply_wd(zero_init(nn.Linear(d_model, d_model, bias=False)))
+
+    def extra_repr(self):
+        return f"d_head={self.d_head},"
+
+    def forward(self, x: FloatTensor, crossattn_cond: FloatTensor, crossattn_mask: Optional[BoolTensor] = None):
+        orig_shape = x.shape
+        x = self.norm(x)
+        q = self.q_proj(x)
+        kv = self.kv_proj(crossattn_cond)
+        q = rearrange(q, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
+        k, v = rearrange(kv, "n l (t nh e) -> t n nh l e", t=2, e=self.d_head)
+        # broadcast masked keys over every head and every query
+        crossattn_mask = rearrange(crossattn_mask, "n l -> n 1 1 l")
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=crossattn_mask)
+        x = rearrange(x, "n nh (h w) e -> n h w (nh e)", h=orig_shape[-3], w=orig_shape[-2])
+        x = self.dropout(x)
+        x = self.out_proj(x)
+        return x
+
+
 class FeedForwardBlock(nn.Module):
     def __init__(self, d_model, d_ff, cond_features, dropout=0.0):
         super().__init__()
@@ -484,13 +514,20 @@ class TransformerLayer(nn.Module):
 
 
 class NeighborhoodTransformerLayer(nn.Module):
-    def __init__(self, d_model, d_ff, d_head, cond_features, kernel_size, dropout=0.0):
+    def __init__(self, d_model, d_ff, d_head, cond_features, kernel_size, cross_attn: Optional[CrossAttentionBlock] = None, dropout=0.0):
         super().__init__()
         self.self_attn = NeighborhoodSelfAttentionBlock(d_model, d_head, cond_features, kernel_size, dropout=dropout)
+        self.cross_attn = cross_attn
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
     def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
-        x = checkpoint(self.self_attn, x, pos, cond, crossattn_cond, crossattn_mask)
+        skip_self = x
+        x = checkpoint(self.self_attn, x, pos, cond)
+        x += skip_self
+        if self.cross_attn is not None:
+            skip_cross = x
+            x = checkpoint(self.cross_attn, x, crossattn_cond, crossattn_mask)
+            x += skip_cross
         x = checkpoint(self.ff, x, cond)
         return x
 
@@ -622,6 +659,11 @@ class ShiftedWindowAttentionSpec:
 class NoAttentionSpec:
     pass
 
+@dataclass
+class CrossAttentionSpec:
+    d_head: int
+    d_cross: int
+    dropout: float
 
 @dataclass
 class LevelSpec:
@@ -629,6 +671,7 @@ class LevelSpec:
     width: int
     d_ff: int
     self_attn: Union[GlobalAttentionSpec, NeighborhoodAttentionSpec, ShiftedWindowAttentionSpec, NoAttentionSpec]
+    cross_attn: Optional[CrossAttentionSpec]
 
 
 @dataclass
@@ -641,7 +684,7 @@ class MappingSpec:
 # Model class
 
 class ImageTransformerDenoiserModelV2(nn.Module):
-    def __init__(self, levels, mapping, in_channels, out_channels, patch_size, num_classes=0, mapping_cond_dim=0, dropout=0.0):
+    def __init__(self, levels: Iterable[LevelSpec], mapping, in_channels, out_channels, patch_size, num_classes=0, mapping_cond_dim=0, dropout=0.0):
         super().__init__()
         self.num_classes = num_classes
 
@@ -657,10 +700,16 @@ class ImageTransformerDenoiserModelV2(nn.Module):
 
         self.down_levels, self.up_levels = nn.ModuleList(), nn.ModuleList()
         for i, spec in enumerate(levels):
+            cross_attn: Optional[CrossAttentionBlock] = None if spec.cross_attn is None else CrossAttentionBlock(
+                d_model=spec.width,
+                d_cross=spec.cross_attn.d_cross,
+                d_head=spec.cross_attn.d_head,
+                dropout=spec.cross_attn.dropout,
+            )
             if isinstance(spec.self_attn, GlobalAttentionSpec):
                 layer_factory = lambda _: TransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, dropout=dropout)
             elif isinstance(spec.self_attn, NeighborhoodAttentionSpec):
-                layer_factory = lambda _: NeighborhoodTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.kernel_size, dropout=dropout)
+                layer_factory = lambda _: NeighborhoodTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.kernel_size, cross_attn=cross_attn, dropout=dropout)
             elif isinstance(spec.self_attn, ShiftedWindowAttentionSpec):
                 layer_factory = lambda i: ShiftedWindowTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.window_size, i, dropout=dropout)
             elif isinstance(spec.self_attn, NoAttentionSpec):
@@ -728,7 +777,7 @@ class ImageTransformerDenoiserModelV2(nn.Module):
 
         for up_level, split, skip, pos in reversed(list(zip(self.up_levels, self.splits, skips, poses))):
             x = split(x, skip)
-            x = up_level(x, pos, cond)
+            x = up_level(x, pos, cond, crossattn_cond, crossattn_mask)
 
         # Unpatching
         x = self.out_norm(x)
