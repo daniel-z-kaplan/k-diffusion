@@ -3,11 +3,11 @@
 from dataclasses import dataclass
 from functools import lru_cache, reduce
 import math
-from typing import Union
+from typing import Union, Optional
 
 from einops import rearrange
 import torch
-from torch import nn
+from torch import nn, FloatTensor
 import torch._dynamo
 from torch.nn import functional as F
 
@@ -359,7 +359,7 @@ class SelfAttentionBlock(nn.Module):
     def extra_repr(self):
         return f"d_head={self.d_head},"
 
-    def forward(self, x, pos, cond):
+    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None):
         skip = x
         x = self.norm(x, cond)
         qkv = self.qkv_proj(x)
@@ -401,7 +401,7 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
     def extra_repr(self):
         return f"d_head={self.d_head}, kernel_size={self.kernel_size}"
 
-    def forward(self, x, pos, cond):
+    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None):
         skip = x
         x = self.norm(x, cond)
         qkv = self.qkv_proj(x)
@@ -438,7 +438,7 @@ class ShiftedWindowSelfAttentionBlock(nn.Module):
     def extra_repr(self):
         return f"d_head={self.d_head}, window_size={self.window_size}, window_shift={self.window_shift}"
 
-    def forward(self, x, pos, cond):
+    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None):
         skip = x
         x = self.norm(x, cond)
         qkv = self.qkv_proj(x)
@@ -477,8 +477,8 @@ class TransformerLayer(nn.Module):
         self.self_attn = SelfAttentionBlock(d_model, d_head, cond_features, dropout=dropout)
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
-    def forward(self, x, pos, cond):
-        x = checkpoint(self.self_attn, x, pos, cond)
+    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None):
+        x = checkpoint(self.self_attn, x, pos, cond, crossattn_cond)
         x = checkpoint(self.ff, x, cond)
         return x
 
@@ -489,8 +489,8 @@ class NeighborhoodTransformerLayer(nn.Module):
         self.self_attn = NeighborhoodSelfAttentionBlock(d_model, d_head, cond_features, kernel_size, dropout=dropout)
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
-    def forward(self, x, pos, cond):
-        x = checkpoint(self.self_attn, x, pos, cond)
+    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None):
+        x = checkpoint(self.self_attn, x, pos, cond, crossattn_cond)
         x = checkpoint(self.ff, x, cond)
         return x
 
@@ -502,8 +502,8 @@ class ShiftedWindowTransformerLayer(nn.Module):
         self.self_attn = ShiftedWindowSelfAttentionBlock(d_model, d_head, cond_features, window_size, window_shift, dropout=dropout)
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
-    def forward(self, x, pos, cond):
-        x = checkpoint(self.self_attn, x, pos, cond)
+    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None):
+        x = checkpoint(self.self_attn, x, pos, cond, crossattn_cond)
         x = checkpoint(self.ff, x, cond)
         return x
 
@@ -513,7 +513,7 @@ class NoAttentionTransformerLayer(nn.Module):
         super().__init__()
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
-    def forward(self, x, pos, cond):
+    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None):
         x = checkpoint(self.ff, x, cond)
         return x
 
@@ -694,7 +694,7 @@ class ImageTransformerDenoiserModelV2(nn.Module):
         ]
         return groups
 
-    def forward(self, x, sigma, aug_cond=None, class_cond=None, mapping_cond=None):
+    def forward(self, x, sigma, aug_cond=None, class_cond=None, mapping_cond=None, crossattn_cond: Optional[FloatTensor] = None) -> FloatTensor:
         # Patching
         x = x.movedim(-3, -1)
         x = self.patch_in(x)
@@ -718,13 +718,13 @@ class ImageTransformerDenoiserModelV2(nn.Module):
         # Hourglass transformer
         skips, poses = [], []
         for down_level, merge in zip(self.down_levels, self.merges):
-            x = down_level(x, pos, cond)
+            x = down_level(x, pos, cond, crossattn_cond)
             skips.append(x)
             poses.append(pos)
             x = merge(x)
             pos = downscale_pos(pos)
 
-        x = self.mid_level(x, pos, cond)
+        x = self.mid_level(x, pos, cond, crossattn_cond)
 
         for up_level, split, skip, pos in reversed(list(zip(self.up_levels, self.splits, skips, poses))):
             x = split(x, skip)
