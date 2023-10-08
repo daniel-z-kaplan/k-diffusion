@@ -496,6 +496,7 @@ def main():
         def sample_fn(n):
             x = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
             model_fn, extra_args = model_ema, {}
+            # TODO: crossattn
             if num_classes:
                 extra_args['class_cond'] = torch.randint(0, num_classes, [n], device=device)
                 model_fn = make_cfg_model_fn(model_ema)
