@@ -14,7 +14,7 @@
       "cross_attns": [
         {"d_head": 64, "d_cross": 768, "dropout": 0.1},
         {"d_head": 64, "d_cross": 768, "dropout": 0.1},
-        null
+        {"d_head": 64, "d_cross": 768, "dropout": 0.1}
       ],
       "loss_config": "karras",
       "loss_weighting": "soft-min-snr",

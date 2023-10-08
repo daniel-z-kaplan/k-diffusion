@@ -359,8 +359,8 @@ class SelfAttentionBlock(nn.Module):
     def extra_repr(self):
         return f"d_head={self.d_head},"
 
-    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
-        skip = x
+    def forward(self, x, pos, cond):
+        orig_shape = x.shape
         x = self.norm(x, cond)
         qkv = self.qkv_proj(x)
         pos = rearrange(pos, "... h w e -> ... (h w) e").to(qkv.dtype)
@@ -371,7 +371,7 @@ class SelfAttentionBlock(nn.Module):
             theta = torch.stack((theta, theta, torch.zeros_like(theta)), dim=-3)
             qkv = apply_rotary_emb_(qkv, theta)
             x = flash_attn.flash_attn_qkvpacked_func(qkv, softmax_scale=1.0)
-            x = rearrange(x, "n (h w) nh e -> n h w (nh e)", h=skip.shape[-3], w=skip.shape[-2])
+            x = rearrange(x, "n (h w) nh e -> n h w (nh e)", h=orig_shape[-3], w=orig_shape[-2])
         else:
             q, k, v = rearrange(qkv, "n h w (t nh e) -> t n nh (h w) e", t=3, e=self.d_head)
             q, k = scale_for_cosine_sim(q, k, self.scale[:, None, None], 1e-6)
@@ -379,10 +379,10 @@ class SelfAttentionBlock(nn.Module):
             q = apply_rotary_emb_(q, theta)
             k = apply_rotary_emb_(k, theta)
             x = F.scaled_dot_product_attention(q, k, v, scale=1.0)
-            x = rearrange(x, "n nh (h w) e -> n h w (nh e)", h=skip.shape[-3], w=skip.shape[-2])
+            x = rearrange(x, "n nh (h w) e -> n h w (nh e)", h=orig_shape[-3], w=orig_shape[-2])
         x = self.dropout(x)
         x = self.out_proj(x)
-        return x + skip
+        return x
 
 
 class NeighborhoodSelfAttentionBlock(nn.Module):
@@ -502,13 +502,20 @@ class FeedForwardBlock(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, d_model, d_ff, d_head, cond_features, dropout=0.0):
+    def __init__(self, d_model, d_ff, d_head, cond_features, cross_attn: Optional[CrossAttentionBlock] = None, dropout=0.0):
         super().__init__()
         self.self_attn = SelfAttentionBlock(d_model, d_head, cond_features, dropout=dropout)
+        self.cross_attn = cross_attn
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
     def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
-        x = checkpoint(self.self_attn, x, pos, cond, crossattn_cond, crossattn_mask)
+        skip_self = x
+        x = checkpoint(self.self_attn, x, pos, cond)
+        x += skip_self
+        if self.cross_attn is not None:
+            skip_cross = x
+            x = checkpoint(self.cross_attn, x, crossattn_cond, crossattn_mask)
+            x += skip_cross
         x = checkpoint(self.ff, x, cond)
         return x
 
@@ -707,7 +714,7 @@ class ImageTransformerDenoiserModelV2(nn.Module):
                 dropout=spec.cross_attn.dropout,
             )
             if isinstance(spec.self_attn, GlobalAttentionSpec):
-                layer_factory = lambda _: TransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, dropout=dropout)
+                layer_factory = lambda _: TransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, cross_attn=cross_attn, dropout=dropout)
             elif isinstance(spec.self_attn, NeighborhoodAttentionSpec):
                 layer_factory = lambda _: NeighborhoodTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.kernel_size, cross_attn=cross_attn, dropout=dropout)
             elif isinstance(spec.self_attn, ShiftedWindowAttentionSpec):
