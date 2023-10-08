@@ -23,7 +23,7 @@ from torch import optim, LongTensor, FloatTensor, BoolTensor, inference_mode
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
-from typing import List, Optional, Literal
+from typing import List, Optional
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
@@ -241,6 +241,10 @@ def main():
         mask_handle: Work = dist.broadcast(token_mask, 0, async_op=True)
         emb_handle.wait()
         mask_handle.wait()
+        emptystr_uncond: FloatTensor = text_embeds[text_uncond_ix].unsqueeze(0)
+        emptystr_uncond_mask: BoolTensor = token_mask[text_uncond_ix].unsqueeze(0)
+        allzeros_uncond: FloatTensor = torch.zeros_like(emptystr_uncond)
+        allzeros_uncond_mask: BoolTensor = torch.ones_like(emptystr_uncond_mask)
 
     if opt_config['type'] == 'adamw':
         opt = optim.AdamW(groups,
@@ -287,6 +291,9 @@ def main():
     ema_stats = {}
 
     uses_crossattn: bool = 'cross_attns' in model_config and model_config['cross_attns']
+    if uses_crossattn:
+        assert 'demo_uncond' in dataset_config
+        assert dataset_config['demo_uncond'] == 'allzeros' or dataset_config['demo_uncond'] == 'emptystr'
 
     tf = transforms.Compose([
         transforms.Resize(size[0], interpolation=transforms.InterpolationMode.BICUBIC),
@@ -433,13 +440,26 @@ def main():
 
     cfg_scale = 1.
 
-    def make_cfg_model_fn(model, uncond: FloatTensor, cond_type: Literal['class_cond', 'crossattn_cond']):
-        def cfg_model_fn(x, sigma, cond: FloatTensor):
+    def make_cfg_model_fn(model):
+        def cfg_model_fn(x, sigma, class_cond):
             x_in = torch.cat([x, x])
             sigma_in = torch.cat([sigma, sigma])
-            cond_in = torch.cat([uncond, cond])
-            cond_kwargs = { cond_type: cond_in }
-            out = model(x_in, sigma_in, **cond_kwargs)
+            class_uncond = torch.full_like(class_cond, num_classes)
+            class_cond_in = torch.cat([class_uncond, class_cond])
+            out = model(x_in, sigma_in, class_cond=class_cond_in)
+            out_uncond, out_cond = out.chunk(2)
+            return out_uncond + (out_cond - out_uncond) * cfg_scale
+        if cfg_scale != 1:
+            return cfg_model_fn
+        return model
+
+    def make_cfg_crossattn_model_fn(model, xuncond: FloatTensor, xuncond_mask: BoolTensor):
+        def cfg_model_fn(x, sigma, xcond: FloatTensor, xcond_mask: BoolTensor):
+            x_in = torch.cat([x, x])
+            sigma_in = torch.cat([sigma, sigma])
+            xcond_in = torch.cat([xuncond, xcond])
+            xcond_mask_in = torch.cat([xuncond_mask, xcond_mask])
+            out: FloatTensor = model(x_in, sigma_in, crossattn_cond=xcond_in, crossattn_mask=xcond_mask_in)
             out_uncond, out_cond = out.chunk(2)
             return out_uncond + (out_cond - out_uncond) * cfg_scale
         if cfg_scale != 1:
@@ -464,16 +484,24 @@ def main():
             # these will have CFG applied, which is silly but free (in wall-time) since they coexist with batch items that legitimately need CFG
             caption_ix = torch.randint(0, text_embeds.shape[0], [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(caption_ix, 0)
-            caption_embed = text_embeds.index_select(0, caption_ix[accelerator.process_index])
-            extra_args['crossattn_cond'] = caption_embed
-            class_uncond = text_embeds[text_uncond_ix].unsqueeze(0)
-            model_fn = make_cfg_model_fn(model_ema, class_uncond, cond_type='crossattn_cond')
+            xcond: FloatTensor = text_embeds.index_select(0, caption_ix[accelerator.process_index])
+            xcond_mask: BoolTensor = token_mask.index_select(0, caption_ix[accelerator.process_index])
+            if dataset_config['demo_uncond'] == 'allzeros':
+                xcond[caption_ix[accelerator.process_index] == text_uncond_ix] = 0
+                xcond_mask[caption_ix[accelerator.process_index] == text_uncond_ix] = 1
+                xuncond: FloatTensor = allzeros_uncond
+                xuncond_mask: BoolTensor = allzeros_uncond_mask
+            elif dataset_config['demo_uncond'] == 'emptystr':
+                xuncond: FloatTensor = emptystr_uncond
+                xuncond_mask: BoolTensor = emptystr_uncond_mask
+            extra_args['crossattn_cond'] = xcond
+            extra_args['crossattn_mask'] = xcond_mask
+            model_fn = make_cfg_crossattn_model_fn(model_ema, xuncond=xuncond, xuncond_mask=xuncond_mask)
         elif num_classes:
             class_cond = torch.randint(0, num_classes, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(class_cond, 0)
             extra_args['class_cond'] = class_cond[accelerator.process_index]
-            class_uncond = torch.full_like(class_cond, num_classes)
-            model_fn = make_cfg_model_fn(model_ema, class_uncond, cond_type='class_cond')
+            model_fn = make_cfg_model_fn(model_ema)
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
         x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
         x_0 = accelerator.gather(x_0)[:args.sample_n]
@@ -566,7 +594,13 @@ def main():
                         batch_text_embeds: FloatTensor = text_embeds.index_select(0, batch['embed_ix'])
                         batch_text_embeds[drop < cond_dropout_rate] = text_embeds[text_uncond_ix]
                         batch_text_embeds[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 0
+
+                        batch_token_masks: BoolTensor = token_mask.index_select(0, batch['embed_ix'])
+                        batch_token_masks[drop < cond_dropout_rate] = token_mask[text_uncond_ix]
+                        batch_token_masks[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 1
+
                         extra_args['crossattn_cond'] = batch_text_embeds
+                        extra_args['crossattn_mask'] = batch_token_masks
                     elif num_classes:
                         class_cond = batch[class_key]
                         drop = torch.rand(class_cond.shape, device=class_cond.device)
