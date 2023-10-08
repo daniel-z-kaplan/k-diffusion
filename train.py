@@ -169,7 +169,10 @@ def main():
         class_captions: List[str] = [uncond, *flower_classes]
         
         text_model_name = 'openai/clip-vit-large-patch14'
-        text_config: CLIPTextConfig = CLIPTextConfig.from_pretrained(text_model_name)
+        text_config: CLIPTextConfig = CLIPTextConfig.from_pretrained(
+            text_model_name,
+            cache_dir=args.text_model_hf_cache_dir,
+        )
         max_length: int = text_config.max_position_embeddings
 
         expected_embed_shape = torch.Size((len(class_captions), max_length, text_config.hidden_size))
