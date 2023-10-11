@@ -437,7 +437,7 @@ class ShiftedWindowSelfAttentionBlock(nn.Module):
     def extra_repr(self):
         return f"d_head={self.d_head}, window_size={self.window_size}, window_shift={self.window_shift}"
 
-    def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
+    def forward(self, x, pos, cond):
         skip = x
         x = self.norm(x, cond)
         qkv = self.qkv_proj(x)
@@ -547,7 +547,7 @@ class ShiftedWindowTransformerLayer(nn.Module):
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
     def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
-        x = checkpoint(self.self_attn, x, pos, cond, crossattn_cond, crossattn_mask)
+        x = checkpoint(self.self_attn, x, pos, cond)
         x = checkpoint(self.ff, x, cond)
         return x
 
