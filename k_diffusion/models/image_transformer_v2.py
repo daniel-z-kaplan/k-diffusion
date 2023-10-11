@@ -454,12 +454,12 @@ class ShiftedWindowSelfAttentionBlock(nn.Module):
 
 
 class CrossAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, d_cross: int, d_head: int, dropout=0.):
+    def __init__(self, d_model: int, d_cross: int, d_head: int, cond_features: int, dropout=0.):
         super().__init__()
         self.d_head = d_head
         self.dropout = dropout
         self.n_heads = d_model // d_head
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = AdaRMSNorm(d_model, cond_features)
         self.q_proj = apply_wd(nn.Linear(d_model, d_model, bias=False))
         self.kv_proj = apply_wd(nn.Linear(d_cross, d_model * 2, bias=False))
         self.dropout = nn.Dropout(dropout)
@@ -468,9 +468,9 @@ class CrossAttentionBlock(nn.Module):
     def extra_repr(self):
         return f"d_head={self.d_head},"
 
-    def forward(self, x: FloatTensor, crossattn_cond: FloatTensor, crossattn_mask: Optional[BoolTensor] = None):
+    def forward(self, x: FloatTensor, cond: FloatTensor, crossattn_cond: FloatTensor, crossattn_mask: Optional[BoolTensor] = None):
         orig_shape = x.shape
-        x = self.norm(x)
+        x = self.norm(x, cond)
         q = self.q_proj(x)
         kv = self.kv_proj(crossattn_cond)
         q = rearrange(q, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
@@ -514,7 +514,7 @@ class TransformerLayer(nn.Module):
         x += skip_self
         if self.cross_attn is not None:
             skip_cross = x
-            x = checkpoint(self.cross_attn, x, crossattn_cond, crossattn_mask)
+            x = checkpoint(self.cross_attn, x, cond, crossattn_cond, crossattn_mask)
             x += skip_cross
         x = checkpoint(self.ff, x, cond)
         return x
@@ -533,7 +533,7 @@ class NeighborhoodTransformerLayer(nn.Module):
         x += skip_self
         if self.cross_attn is not None:
             skip_cross = x
-            x = checkpoint(self.cross_attn, x, crossattn_cond, crossattn_mask)
+            x = checkpoint(self.cross_attn, x, cond, crossattn_cond, crossattn_mask)
             x += skip_cross
         x = checkpoint(self.ff, x, cond)
         return x
@@ -711,6 +711,7 @@ class ImageTransformerDenoiserModelV2(nn.Module):
                 d_model=spec.width,
                 d_cross=spec.cross_attn.d_cross,
                 d_head=spec.cross_attn.d_head,
+                cond_features=mapping.width,
                 dropout=spec.cross_attn.dropout,
             )
             if isinstance(spec.self_attn, GlobalAttentionSpec):
