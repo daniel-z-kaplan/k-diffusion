@@ -210,7 +210,6 @@ def main():
                 return_length=True,
                 add_special_tokens=True,
             )
-            use_penult = True
             tokens: LongTensor = tokens_out['input_ids'].to(accelerator.device)
             token_mask: LongTensor = tokens_out['attention_mask'].to(accelerator.device, dtype=torch.bool)
             del tokens_out, tokenizer
@@ -224,17 +223,13 @@ def main():
                 encoder_out: BaseModelOutputWithPooling = text_model.forward(
                     tokens,
                     # attention_mask=token_mask,
-                    output_hidden_states=use_penult,
+                    # we need it to give us access to penultimate hidden states
+                    output_hidden_states=True,
                     return_dict=True,
                 )
                 del tokens
-                if use_penult:
-                    penult: FloatTensor = encoder_out.hidden_states[-2]
-                    normed: FloatTensor = text_model.text_model.final_layer_norm.forward(penult)
-                    text_embeds: FloatTensor = normed.to(embed_dtype)
-                    del penult, normed
-                else:
-                    text_embeds: FloatTensor = encoder_out.last_hidden_state.to(embed_dtype)
+                # these are penultimate hidden states
+                text_embeds: FloatTensor = encoder_out.hidden_states[-2].to(embed_dtype)
                 assert text_embeds.shape == expected_embed_shape
                 del encoder_out, text_model
         else:
