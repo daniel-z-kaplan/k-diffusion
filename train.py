@@ -19,14 +19,18 @@ from torch import distributed as dist
 from torch.distributed import Work
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim, LongTensor, FloatTensor, BoolTensor, inference_mode
+from torch import optim, LongTensor, FloatTensor, BoolTensor, ByteTensor, inference_mode
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
 from typing import List, Optional
+from numpy.typing import NDArray
+from functorch.einops import rearrange
+from PIL import Image, ImageFont
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
+from kdiff_trainer.make_captioned_grid import make_grid_captioner, GridCaptioner, BBox, FontMetrics, get_font_metrics
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -90,6 +94,10 @@ def main():
                    help='the multiprocessing start method')
     p.add_argument('--text-model-hf-cache-dir', type=str, default=None,
                    help='disk directory into which HF should download text model checkpoints')
+    p.add_argument('--font', type=str, default=None,
+                   help='font used for drawing demo grids (e.g. /usr/share/fonts/dejavu/DejaVuSansMono.ttf)')
+    p.add_argument('--demo-img-compress', action='store_true',
+                   help='Demo image file format. False: .png; True: .jpg')
     p.add_argument('--wandb-entity', type=str,
                    help='the wandb entity name')
     p.add_argument('--wandb-group', type=str,
@@ -164,7 +172,7 @@ def main():
     if 'classes_to_captions' in dataset_config:
         assert dataset_config['classes_to_captions'] == 'oxford-flowers'
         from transformers import CLIPTextConfig
-        from dataset_meta.oxford_flowers import flower_classes
+        from kdiff_trainer.dataset_meta.oxford_flowers import flower_classes
         uncond = ''
         class_captions: List[str] = [uncond, *flower_classes]
         
@@ -466,12 +474,11 @@ def main():
 
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
-    def demo():
+    def demo(captioner: GridCaptioner):
         if accelerator.is_main_process:
             tqdm.write('Sampling...')
         with FSDP.summon_full_params(model_ema):
             pass
-        filename = f'{args.name}_demo_{step:08}.png'
         n_per_proc = math.ceil(args.sample_n / accelerator.num_processes)
         x = torch.randn([accelerator.num_processes, n_per_proc, model_config['input_channels'], size[0], size[1]], generator=demo_gen).to(device)
         dist.broadcast(x, 0)
@@ -501,11 +508,26 @@ def main():
             extra_args['class_cond'] = class_cond[accelerator.process_index]
             model_fn = make_cfg_model_fn(model_ema)
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
-        x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
+        x_0: FloatTensor = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
         x_0 = accelerator.gather(x_0)[:args.sample_n]
         if accelerator.is_main_process:
-            grid = utils.make_grid(x_0, nrow=math.ceil(args.sample_n ** 0.5), padding=0)
-            K.utils.to_pil_image(grid).save(filename)
+            if uses_crossattn:
+                rgb_imgs: ByteTensor = x_0.clamp(-1, 1).add(1).mul(127.5).byte()
+                imgs_np: NDArray = rearrange(rgb_imgs, 'b rgb row col -> b row col rgb').contiguous().cpu().numpy()
+                imgs: List[Image.Image] = [Image.fromarray(img, mode='RGB') for img in imgs_np]
+                captions: List[str] = [class_captions[caption_ix_.item()] for caption_ix_ in caption_ix.flatten().cpu()]
+                grid_pil: Image.Image = captioner.__call__(
+                    imgs=imgs,
+                    captions=captions,
+                )
+            else:
+                grid = utils.make_grid(x_0, nrow=math.ceil(args.sample_n ** 0.5), padding=0)
+                grid_pil: Image.Image = K.utils.to_pil_image(grid)
+            save_kwargs = { 'subsampling': 0, 'quality': 95 } if args.demo_img_compress else {}
+            fext = 'jpg' if args.demo_img_compress else 'png'
+            filename = f'{args.name}_demo_{step:08}.{fext}'
+            grid_pil.save(filename, **save_kwargs)
+
             if use_wandb:
                 wandb.log({'demo_grid': wandb.Image(filename)}, step=step)
 
@@ -657,8 +679,26 @@ def main():
 
                 step += 1
 
+                font = ImageFont.load_default() if args.font is None else ImageFont.truetype(args.font, 25)
+                font_metrics: FontMetrics = get_font_metrics(font)
+
+                pad = 8
+                text_pad = BBox(top=pad, left=pad, bottom=pad, right=pad)
+
+                # TODO: are h and w the right way around?
+                samp_h, samp_w = model_config['input_size']
+                cols: int = math.ceil(args.sample_n ** .5)
+                captioner: GridCaptioner = make_grid_captioner(
+                    font=font,
+                    cols=cols,
+                    font_metrics=font_metrics,
+                    padding=text_pad,
+                    samp_w=samp_w,
+                    samp_h=samp_h,
+                )
+
                 if step % args.demo_every == 0:
-                    demo()
+                    demo(captioner)
 
                 if evaluate_enabled and step > 0 and step % args.evaluate_every == 0:
                     evaluate()
