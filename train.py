@@ -314,7 +314,7 @@ def main():
         if uses_crossattn:
             if 'classes_to_captions' in dataset_config:
                 assert dataset_config['classes_to_captions'] == 'oxford-flowers'
-                from dataset_meta.oxford_flowers import ordinal_to_lexical
+                from kdiff_trainer.dataset_meta.oxford_flowers import ordinal_to_lexical
                 def embed_ix_extractor(batch: BatchData) -> BatchData:
                     labels_ordinal: List[int] = batch['label']
                     # labels_ordinal is 1-indexed.
