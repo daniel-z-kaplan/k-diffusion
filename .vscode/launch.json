@@ -15,7 +15,9 @@
         "--evaluate-n", "0",
         "--batch-size", "32",
         "--sample-n", "36",
-        "--mixed-precision", "bf16"
+        "--mixed-precision", "bf16",
+        "--demo-img-compress",
+        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
       ]
     },
     {
@@ -33,7 +35,9 @@
         "--evaluate-n", "0",
         "--batch-size", "32",
         "--sample-n", "36",
-        "--mixed-precision", "bf16"
+        "--mixed-precision", "bf16",
+        "--demo-img-compress",
+        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
       ]
     },
     // /home/mahouko/.cache/huggingface/accelerate/default_config.yaml
@@ -56,6 +60,8 @@
         "--sample-n", "36",
         "--mixed-precision", "bf16",
         "--start-method", "fork",
+        "--demo-img-compress",
+        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
       ],
       // "env": {
       //   "K_DIFFUSION_USE_COMPILE": "0"
@@ -79,6 +85,8 @@
         "--batch-size", "32",
         "--sample-n", "36",
         "--mixed-precision", "bf16",
+        "--demo-img-compress",
+        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
       ],
       "env": {
         "K_DIFFUSION_USE_COMPILE": "0",
@@ -102,7 +110,12 @@
         "--sample-n", "36",
         "--mixed-precision", "bf16",
         "--start-method", "fork",
+        "--demo-img-compress",
+        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
       ],
+      "env": {
+        "TOKENIZERS_PARALLELISM": "false",
+      }
     },
     {
       "name": "Python: Oxford Flowers Cross-attn (NATTEN) [accelerate]",
@@ -122,6 +135,8 @@
         "--sample-n", "36",
         "--mixed-precision", "bf16",
         "--start-method", "fork",
+        "--demo-img-compress",
+        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
       ],
       "env": {
         "TOKENIZERS_PARALLELISM": "false",
