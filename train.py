@@ -95,7 +95,7 @@ def main():
     p.add_argument('--text-model-hf-cache-dir', type=str, default=None,
                    help='disk directory into which HF should download text model checkpoints')
     p.add_argument('--font', type=str, default=None,
-                   help='font used for drawing demo grids (e.g. /usr/share/fonts/dejavu/DejaVuSansMono.ttf)')
+                   help='font used for drawing demo grids (e.g. /usr/share/fonts/dejavu/DejaVuSansMono.ttf or ./kdiff_trainer/font/DejaVuSansMono.ttf)')
     p.add_argument('--demo-img-compress', action='store_true',
                    help='Demo image file format. False: .png; True: .jpg')
     p.add_argument('--wandb-entity', type=str,

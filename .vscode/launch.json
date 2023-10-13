@@ -17,7 +17,7 @@
         "--sample-n", "36",
         "--mixed-precision", "bf16",
         "--demo-img-compress",
-        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "--font", "./kdiff_trainer/font/DejaVuSansMono.ttf",
       ]
     },
     {
@@ -37,7 +37,7 @@
         "--sample-n", "36",
         "--mixed-precision", "bf16",
         "--demo-img-compress",
-        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "--font", "./kdiff_trainer/font/DejaVuSansMono.ttf",
       ]
     },
     // /home/mahouko/.cache/huggingface/accelerate/default_config.yaml
@@ -61,7 +61,7 @@
         "--mixed-precision", "bf16",
         "--start-method", "fork",
         "--demo-img-compress",
-        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "--font", "./kdiff_trainer/font/DejaVuSansMono.ttf",
       ],
       // "env": {
       //   "K_DIFFUSION_USE_COMPILE": "0"
@@ -86,7 +86,7 @@
         "--sample-n", "36",
         "--mixed-precision", "bf16",
         "--demo-img-compress",
-        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "--font", "./kdiff_trainer/font/DejaVuSansMono.ttf",
       ],
       "env": {
         "K_DIFFUSION_USE_COMPILE": "0",
@@ -111,7 +111,7 @@
         "--mixed-precision", "bf16",
         "--start-method", "fork",
         "--demo-img-compress",
-        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "--font", "./kdiff_trainer/font/DejaVuSansMono.ttf",
       ],
       "env": {
         "TOKENIZERS_PARALLELISM": "false",
@@ -136,7 +136,7 @@
         "--mixed-precision", "bf16",
         "--start-method", "fork",
         "--demo-img-compress",
-        "--font", "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "--font", "./kdiff_trainer/font/DejaVuSansMono.ttf",
       ],
       "env": {
         "TOKENIZERS_PARALLELISM": "false",
