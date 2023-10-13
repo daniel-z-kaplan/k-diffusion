@@ -104,14 +104,14 @@ def make_captioned_grid(
   return out
 
 class GridCaptioner(Protocol):
-  @classmethod
+  @staticmethod
   def __call__(
     imgs: List[Image.Image],
     captions: List[str],
   ) -> Image.Image: ...
 
 class TextWrapperFactory(Protocol):
-  @classmethod
+  @staticmethod
   def __call__(
     width: int,
   ) -> TextWrapper: ...
