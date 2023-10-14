@@ -360,7 +360,7 @@ class SelfAttentionBlock(nn.Module):
         return f"d_head={self.d_head},"
 
     def forward(self, x, pos, cond):
-        orig_shape = x.shape
+        skip = x
         x = self.norm(x, cond)
         qkv = self.qkv_proj(x)
         pos = rearrange(pos, "... h w e -> ... (h w) e").to(qkv.dtype)
@@ -371,7 +371,7 @@ class SelfAttentionBlock(nn.Module):
             theta = torch.stack((theta, theta, torch.zeros_like(theta)), dim=-3)
             qkv = apply_rotary_emb_(qkv, theta)
             x = flash_attn.flash_attn_qkvpacked_func(qkv, softmax_scale=1.0)
-            x = rearrange(x, "n (h w) nh e -> n h w (nh e)", h=orig_shape[-3], w=orig_shape[-2])
+            x = rearrange(x, "n (h w) nh e -> n h w (nh e)", h=skip.shape[-3], w=skip.shape[-2])
         else:
             q, k, v = rearrange(qkv, "n h w (t nh e) -> t n nh (h w) e", t=3, e=self.d_head)
             q, k = scale_for_cosine_sim(q, k, self.scale[:, None, None], 1e-6)
@@ -379,10 +379,10 @@ class SelfAttentionBlock(nn.Module):
             q = apply_rotary_emb_(q, theta)
             k = apply_rotary_emb_(k, theta)
             x = F.scaled_dot_product_attention(q, k, v, scale=1.0)
-            x = rearrange(x, "n nh (h w) e -> n h w (nh e)", h=orig_shape[-3], w=orig_shape[-2])
+            x = rearrange(x, "n nh (h w) e -> n h w (nh e)", h=skip.shape[-3], w=skip.shape[-2])
         x = self.dropout(x)
         x = self.out_proj(x)
-        return x
+        return x + skip
 
 
 class NeighborhoodSelfAttentionBlock(nn.Module):
@@ -402,6 +402,7 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
         return f"d_head={self.d_head}, kernel_size={self.kernel_size}"
 
     def forward(self, x, pos, cond):
+        skip = x
         x = self.norm(x, cond)
         qkv = self.qkv_proj(x)
         q, k, v = rearrange(qkv, "n h w (t nh e) -> t n nh h w e", t=3, e=self.d_head)
@@ -417,7 +418,7 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
         x = rearrange(x, "n nh h w e -> n h w (nh e)")
         x = self.dropout(x)
         x = self.out_proj(x)
-        return x
+        return x + skip
 
 
 class ShiftedWindowSelfAttentionBlock(nn.Module):
@@ -469,7 +470,7 @@ class CrossAttentionBlock(nn.Module):
         return f"d_head={self.d_head},"
 
     def forward(self, x: FloatTensor, cond: FloatTensor, crossattn_cond: FloatTensor, crossattn_mask: Optional[BoolTensor] = None):
-        orig_shape = x.shape
+        skip = x
         x = self.norm(x, cond)
         q = self.q_proj(x)
         kv = self.kv_proj(crossattn_cond)
@@ -478,10 +479,10 @@ class CrossAttentionBlock(nn.Module):
         # broadcast masked keys over every head and every query
         crossattn_mask = rearrange(crossattn_mask, "n l -> n 1 1 l")
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=crossattn_mask)
-        x = rearrange(x, "n nh (h w) e -> n h w (nh e)", h=orig_shape[-3], w=orig_shape[-2])
+        x = rearrange(x, "n nh (h w) e -> n h w (nh e)", h=skip.shape[-3], w=skip.shape[-2])
         x = self.dropout(x)
         x = self.out_proj(x)
-        return x
+        return x + skip
 
 
 class FeedForwardBlock(nn.Module):
@@ -509,13 +510,9 @@ class TransformerLayer(nn.Module):
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
     def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
-        skip_self = x
         x = checkpoint(self.self_attn, x, pos, cond)
-        x += skip_self
         if self.cross_attn is not None:
-            skip_cross = x
             x = checkpoint(self.cross_attn, x, cond, crossattn_cond, crossattn_mask)
-            x += skip_cross
         x = checkpoint(self.ff, x, cond)
         return x
 
@@ -528,13 +525,9 @@ class NeighborhoodTransformerLayer(nn.Module):
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
     def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
-        skip_self = x
         x = checkpoint(self.self_attn, x, pos, cond)
-        x += skip_self
         if self.cross_attn is not None:
-            skip_cross = x
             x = checkpoint(self.cross_attn, x, cond, crossattn_cond, crossattn_mask)
-            x += skip_cross
         x = checkpoint(self.ff, x, cond)
         return x
 
