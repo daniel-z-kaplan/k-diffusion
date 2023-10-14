@@ -30,7 +30,7 @@ from PIL import Image, ImageFont
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
-from kdiff_trainer.make_captioned_grid import make_grid_captioner, GridCaptioner, BBox, FontMetrics, get_font_metrics
+from kdiff_trainer.make_captioned_grid import GridCaptioner, BBox, Typesetting, make_grid_captioner, make_typesetting
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -94,8 +94,10 @@ def main():
                    help='the multiprocessing start method')
     p.add_argument('--text-model-hf-cache-dir', type=str, default=None,
                    help='disk directory into which HF should download text model checkpoints')
-    p.add_argument('--font', type=str, default=None,
-                   help='font used for drawing demo grids (e.g. /usr/share/fonts/dejavu/DejaVuSansMono.ttf or ./kdiff_trainer/font/DejaVuSansMono.ttf)')
+    p.add_argument('--font', type=str, default='./kdiff_trainer/font/DejaVuSansMono.ttf',
+                   help='font used for drawing demo grids (e.g. /usr/share/fonts/dejavu/DejaVuSansMono.ttf or ./kdiff_trainer/font/DejaVuSansMono.ttf). Pass empty string for ImageFont.load_default().')
+    p.add_argument('--demo-title-qualifier', type=str, default=None,
+                   help='Additional text to include in title printed in demo grids')
     p.add_argument('--demo-img-compress', action='store_true',
                    help='Demo image file format. False: .png; True: .jpg')
     p.add_argument('--wandb-entity', type=str,
@@ -516,9 +518,13 @@ def main():
                 imgs_np: NDArray = rearrange(rgb_imgs, 'b rgb row col -> b row col rgb').contiguous().cpu().numpy()
                 imgs: List[Image.Image] = [Image.fromarray(img, mode='RGB') for img in imgs_np]
                 captions: List[str] = [class_captions[caption_ix_.item()] for caption_ix_ in caption_ix.flatten().cpu()]
+                title = f'[step {step}] {args.name} {args.config}'
+                if args.demo_title_qualifier:
+                    title += f' {args.demo_title_qualifier}'
                 grid_pil: Image.Image = captioner.__call__(
                     imgs=imgs,
                     captions=captions,
+                    title=title,
                 )
             else:
                 grid = utils.make_grid(x_0, nrow=math.ceil(args.sample_n ** 0.5), padding=0)
@@ -679,22 +685,34 @@ def main():
 
                 step += 1
 
-                font = ImageFont.load_default() if args.font is None else ImageFont.truetype(args.font, 25)
-                font_metrics: FontMetrics = get_font_metrics(font)
-
                 pad = 8
-                text_pad = BBox(top=pad, left=pad, bottom=pad, right=pad)
+                cell_pad = BBox(top=pad, left=pad, bottom=pad, right=pad)
+                # abusing bottom padding to simulate a margin-bottom
+                title_pad = BBox(top=pad, left=pad, bottom=pad*3, right=pad)
 
+                cell_font: ImageFont = ImageFont.truetype(args.font, 25) if args.font else ImageFont.load_default()
+                title_font: ImageFont = ImageFont.truetype(args.font, 50) if args.font else ImageFont.load_default()
+
+                cols: int = math.ceil(args.sample_n ** .5)
                 # TODO: are h and w the right way around?
                 samp_h, samp_w = model_config['input_size']
-                cols: int = math.ceil(args.sample_n ** .5)
+                cell_type: Typesetting = make_typesetting(
+                    x_wrap_px=samp_w,
+                    font=cell_font,
+                    padding=cell_pad,
+                )
+                title_type: Typesetting = make_typesetting(
+                    x_wrap_px=samp_w*cols,
+                    font=title_font,
+                    padding=title_pad,
+                )
+
                 captioner: GridCaptioner = make_grid_captioner(
-                    font=font,
+                    cell_type=cell_type,
                     cols=cols,
-                    font_metrics=font_metrics,
-                    padding=text_pad,
                     samp_w=samp_w,
                     samp_h=samp_h,
+                    title_type=title_type,
                 )
 
                 if step % args.demo_every == 0:
