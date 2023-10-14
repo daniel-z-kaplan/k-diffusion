@@ -155,9 +155,10 @@ class RMSNorm(nn.Module):
 
 
 class AdaRMSNorm(nn.Module):
-    def __init__(self, features, cond_features, eps=1e-6):
+    def __init__(self, features, cond_features, eps=1e-6, new_dims=2):
         super().__init__()
         self.eps = eps
+        self.new_dims = new_dims
         self.linear = apply_wd(zero_init(nn.Linear(cond_features, features, bias=False)))
         tag_module(self.linear, "mapping")
 
@@ -165,7 +166,9 @@ class AdaRMSNorm(nn.Module):
         return f"eps={self.eps},"
 
     def forward(self, x, cond):
-        return rms_norm(x, self.linear(cond)[:, None, None, :] + 1, self.eps)
+        cond = self.linear(cond)
+        cond = cond[:, *(None,)*self.new_dims, :] + 1
+        return rms_norm(x, cond, self.eps)
 
 
 # Rotary position embeddings
@@ -462,6 +465,7 @@ class CrossAttentionBlock(nn.Module):
         self.n_heads = d_model // d_head
         self.norm = AdaRMSNorm(d_model, cond_features)
         self.q_proj = apply_wd(nn.Linear(d_model, d_model, bias=False))
+        self.crossattn_norm = AdaRMSNorm(d_cross, cond_features, new_dims=1)
         self.kv_proj = apply_wd(nn.Linear(d_cross, d_model * 2, bias=False))
         self.dropout = nn.Dropout(dropout)
         self.out_proj = apply_wd(zero_init(nn.Linear(d_model, d_model, bias=False)))
@@ -473,6 +477,7 @@ class CrossAttentionBlock(nn.Module):
         skip = x
         x = self.norm(x, cond)
         q = self.q_proj(x)
+        crossattn_cond = self.crossattn_norm(crossattn_cond, cond)
         kv = self.kv_proj(crossattn_cond)
         q = rearrange(q, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
         k, v = rearrange(kv, "n l (t nh e) -> t n nh l e", t=2, e=self.d_head)
