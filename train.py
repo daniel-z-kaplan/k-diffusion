@@ -10,6 +10,8 @@ import math
 import json
 from pathlib import Path
 import time
+from os import makedirs
+from os.path import relpath
 
 import accelerate
 import safetensors.torch as safetorch
@@ -51,6 +53,10 @@ def main():
                    help='compile the model')
     p.add_argument('--config', type=str, required=True,
                    help='the configuration file')
+    p.add_argument('--out-root', type=str, default='.',
+                   help='outputs (checkpoints, demo samples, state, metrics) will be saved under this directory')
+    p.add_argument('--output-to-subdir', action='store_true',
+                   help='for outputs (checkpoints, demo samples, state, metrics): whether to use {{out_root}}/{{name}}/ subdirectories. When True: saves/loads from/to {{out_root}}/{{name}}/[{{product}}/]*, ({{product}}/ subdirectories are used for demo samples and checkpoints). When False: saves/loads from/to {{out_root}}/{{name}}_*')
     p.add_argument('--demo-every', type=int, default=500,
                    help='save a demo grid every this many steps')
     p.add_argument('--dinov2-model', type=str, default='vitl14',
@@ -385,14 +391,31 @@ def main():
     model = K.config.make_denoiser_wrapper(config)(inner_model)
     model_ema = K.config.make_denoiser_wrapper(config)(inner_model_ema)
 
-    state_path = Path(f'{args.name}_state.json')
+    if args.output_to_subdir:
+        run_root = f'{args.out_root}/{args.name}'
+        state_root = metrics_root = run_root
+        demo_root = f'{run_root}/demo'
+        ckpt_root = f'{run_root}/ckpt'
+        run_qualifier = f''
+    else:
+        run_root = demo_root = ckpt_root = state_root = metrics_root = args.out_root
+        run_qualifier = f'{args.name}_'
+
+    if accelerator.is_main_process:
+        makedirs(run_root, exist_ok=True)
+        makedirs(state_root, exist_ok=True)
+        makedirs(metrics_root, exist_ok=True)
+        makedirs(demo_root, exist_ok=True)
+        makedirs(ckpt_root, exist_ok=True)
+
+    state_path = Path(f'{state_root}/{run_qualifier}state.json')
 
     if state_path.exists() or args.resume:
         if args.resume:
             ckpt_path = args.resume
         if not args.resume:
             state = json.load(open(state_path))
-            ckpt_path = state['latest_checkpoint']
+            ckpt_path = f"{state_root}/{state['latest_checkpoint']}"
         if accelerator.is_main_process:
             print(f'Resuming from {ckpt_path}...')
         ckpt = torch.load(ckpt_path, map_location='cpu')
@@ -443,7 +466,7 @@ def main():
             print('Computing features for reals...')
         reals_features = K.evaluation.compute_features(accelerator, lambda x: next(train_iter)[image_key][1], extractor, args.evaluate_n, args.batch_size)
         if accelerator.is_main_process:
-            metrics_log = K.utils.CSVLogger(f'{args.name}_metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
+            metrics_log = K.utils.CSVLogger(f'{metrics_root}/{run_qualifier}metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
         del train_iter
 
     cfg_scale = 1.
@@ -531,7 +554,7 @@ def main():
                 grid_pil: Image.Image = K.utils.to_pil_image(grid)
             save_kwargs = { 'subsampling': 0, 'quality': 95 } if args.demo_img_compress else {}
             fext = 'jpg' if args.demo_img_compress else 'png'
-            filename = f'{args.name}_demo_{step:08}.{fext}'
+            filename = f'{demo_root}/{run_qualifier}{step:08}.{fext}'
             grid_pil.save(filename, **save_kwargs)
 
             if use_wandb:
@@ -568,7 +591,7 @@ def main():
 
     def save():
         accelerator.wait_for_everyone()
-        filename = f'{args.name}_{step:08}.pth'
+        filename = f'{ckpt_root}/{run_qualifier}{step:08}.pth'
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
 
@@ -594,7 +617,7 @@ def main():
                     'elapsed': elapsed,
                 }
                 accelerator.save(obj, filename)
-                state_obj = {'latest_checkpoint': filename}
+                state_obj = {'latest_checkpoint': relpath(filename, state_root)}
                 json.dump(state_obj, open(state_path, 'w'))
                 if args.wandb_save_model and use_wandb:
                     wandb.save(filename)
