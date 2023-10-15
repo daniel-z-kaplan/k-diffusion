@@ -458,7 +458,8 @@ class ShiftedWindowSelfAttentionBlock(nn.Module):
 
 
 class CrossAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, d_cross: int, d_head: int, cond_features: int, dropout=0.):
+    qk_scale: Optional[nn.Parameter]
+    def __init__(self, d_model: int, d_cross: int, d_head: int, cond_features: int, scale_qk: bool, dropout=0.):
         super().__init__()
         self.d_head = d_head
         self.dropout = dropout
@@ -468,6 +469,7 @@ class CrossAttentionBlock(nn.Module):
         self.crossattn_norm = AdaRMSNorm(d_cross, cond_features, new_dims=1)
         self.kv_proj = apply_wd(nn.Linear(d_cross, d_model * 2, bias=False))
         self.dropout = nn.Dropout(dropout)
+        self.qk_scale = nn.Parameter(torch.full([self.n_heads], 10.0)) if scale_qk else None
         self.out_proj = apply_wd(zero_init(nn.Linear(d_model, d_model, bias=False)))
 
     def extra_repr(self):
@@ -481,6 +483,8 @@ class CrossAttentionBlock(nn.Module):
         kv = self.kv_proj(crossattn_cond)
         q = rearrange(q, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
         k, v = rearrange(kv, "n l (t nh e) -> t n nh l e", t=2, e=self.d_head)
+        if self.qk_scale is not None:
+            q, k = scale_for_cosine_sim(q, k, self.qk_scale[:, None, None], 1e-6)
         # broadcast masked keys over every head and every query
         crossattn_mask = rearrange(crossattn_mask, "n l -> n 1 1 l")
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=crossattn_mask)
@@ -668,6 +672,7 @@ class NoAttentionSpec:
 class CrossAttentionSpec:
     d_head: int
     d_cross: int
+    scale_qk: bool
     dropout: float
 
 @dataclass
@@ -710,6 +715,7 @@ class ImageTransformerDenoiserModelV2(nn.Module):
                 d_cross=spec.cross_attn.d_cross,
                 d_head=spec.cross_attn.d_head,
                 cond_features=mapping.width,
+                scale_qk=spec.cross_attn.scale_qk,
                 dropout=spec.cross_attn.dropout,
             )
             if isinstance(spec.self_attn, GlobalAttentionSpec):

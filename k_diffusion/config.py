@@ -192,7 +192,7 @@ def make_model(config):
             else:
                 raise ValueError(f'unsupported self attention type {self_attn["type"]}')
             if cross_attn is not None:
-                cross_attn = models.image_transformer_v2.CrossAttentionSpec(cross_attn.get('d_head', 64), cross_attn.get('d_cross', 768), cross_attn.get('dropout', .1))
+                cross_attn = models.image_transformer_v2.CrossAttentionSpec(cross_attn.get('d_head', 64), cross_attn.get('d_cross', 768), cross_attn.get('scale_qk', True), cross_attn.get('dropout', .1))
             levels.append(models.image_transformer_v2.LevelSpec(depth, width, d_ff, self_attn, cross_attn))
         mapping = models.image_transformer_v2.MappingSpec(config['mapping_depth'], config['mapping_width'], config['mapping_d_ff'])
         model = models.ImageTransformerDenoiserModelV2(

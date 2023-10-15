@@ -12,9 +12,9 @@
           {"type": "global", "d_head": 64}
       ],
       "cross_attns": [
-        {"d_head": 64, "d_cross": 768, "dropout": 0.1},
-        {"d_head": 64, "d_cross": 768, "dropout": 0.1},
-        {"d_head": 64, "d_cross": 768, "dropout": 0.1}
+        {"d_head": 64, "d_cross": 768, "dropout": 0.1, "scale_qk": true},
+        {"d_head": 64, "d_cross": 768, "dropout": 0.1, "scale_qk": true},
+        {"d_head": 64, "d_cross": 768, "dropout": 0.1, "scale_qk": true}
       ],
       "loss_config": "karras",
       "loss_weighting": "soft-min-snr",
