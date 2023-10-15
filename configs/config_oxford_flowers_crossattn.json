@@ -34,7 +34,8 @@
       "classes_to_captions": "oxford-flowers",
       "allzeros_uncond_rate": 1.0,
       "cond_dropout_rate": 0.1,
-      "demo_uncond": "allzeros"
+      "demo_uncond": "allzeros",
+      "eval_uncond": "allzeros"
   },
   "optimizer": {
       "type": "adamw",

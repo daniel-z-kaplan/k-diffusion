@@ -67,7 +67,7 @@ def main():
     p.add_argument('--end-step', type=int, default=None,
                    help='the step to end training at')
     p.add_argument('--evaluate-every', type=int, default=10000,
-                   help='save a demo grid every this many steps')
+                   help='evaluate every this many steps')
     p.add_argument('--evaluate-with', type=str, default='inception',
                    choices=['inception', 'clip', 'dinov2'],
                    help='the feature extractor to use for evaluation')
@@ -424,9 +424,10 @@ def main():
             cfg_args: CrossAttnCFGArgs = get_precomputed_cond_cfg_args(
                 accelerator=accelerator,
                 precomputed_conds=precomputed_conds,
-                demo_uncond=dataset_config['demo_uncond'],
+                uncond_type=dataset_config['demo_uncond'],
                 n_per_proc=n_per_proc,
-                demo_gen=demo_gen,
+                distribute=True,
+                rng=demo_gen,
             )
             caption_ix = cfg_args.caption_ix
             extra_args = {**extra_args, **cfg_args.sampling_extra_args}
@@ -476,8 +477,19 @@ def main():
         def sample_fn(n):
             x = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
             model_fn, extra_args = model_ema, {}
-            # TODO: crossattn
-            if num_classes:
+            if uses_crossattn:
+                assert precomputed_conds is not None
+                cfg_args: CrossAttnCFGArgs = get_precomputed_cond_cfg_args(
+                    accelerator=accelerator,
+                    precomputed_conds=precomputed_conds,
+                    uncond_type=dataset_config['eval_uncond'],
+                    n_per_proc=n,
+                    distribute=False,
+                    rng=None,
+                )
+                extra_args = {**extra_args, **cfg_args.sampling_extra_args}
+                model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=cfg_args.masked_uncond, cfg_scale=cfg_scale)
+            elif num_classes:
                 extra_args['class_cond'] = torch.randint(0, num_classes, [n], device=device)
                 model_fn = make_cfg_model_fn(model_ema)
             x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=True)
