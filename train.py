@@ -25,11 +25,13 @@ from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
 from typing import List, Optional
-from PIL import Image, ImageFont
+from PIL import Image
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
-from kdiff_trainer.make_captioned_grid import GridCaptioner, BBox, Typesetting, make_grid_captioner, make_typesetting
+from kdiff_trainer.dimensions import Dimensions
+from kdiff_trainer.make_default_grid_captioner import make_default_grid_captioner
+from kdiff_trainer.make_captioned_grid import GridCaptioner
 from kdiff_trainer.xattn.precompute_conds import precompute_conds, PrecomputedConds
 from kdiff_trainer.xattn.precomputed_cond_cfg_args import get_precomputed_cond_cfg_args
 from kdiff_trainer.xattn.make_cfg_crossattn_model import make_cfg_crossattn_model_fn
@@ -622,34 +624,13 @@ def main():
 
                 step += 1
 
-                pad = 8
-                cell_pad = BBox(top=pad, left=pad, bottom=pad, right=pad)
-                # abusing bottom padding to simulate a margin-bottom
-                title_pad = BBox(top=pad, left=pad, bottom=pad*3, right=pad)
-
-                cell_font: ImageFont = ImageFont.truetype(args.font, 25) if args.font else ImageFont.load_default()
-                title_font: ImageFont = ImageFont.truetype(args.font, 50) if args.font else ImageFont.load_default()
-
-                cols: int = math.ceil(args.sample_n ** .5)
                 # TODO: are h and w the right way around?
                 samp_h, samp_w = model_config['input_size']
-                cell_type: Typesetting = make_typesetting(
-                    x_wrap_px=samp_w,
-                    font=cell_font,
-                    padding=cell_pad,
-                )
-                title_type: Typesetting = make_typesetting(
-                    x_wrap_px=samp_w*cols,
-                    font=title_font,
-                    padding=title_pad,
-                )
-
-                captioner: GridCaptioner = make_grid_captioner(
-                    cell_type=cell_type,
-                    cols=cols,
-                    samp_w=samp_w,
-                    samp_h=samp_h,
-                    title_type=title_type,
+                sample_size = Dimensions(height=samp_h, width=samp_w)
+                captioner: GridCaptioner = make_default_grid_captioner(
+                    font_path=args.font,
+                    sample_n=args.sample_n,
+                    sample_size=sample_size,
                 )
 
                 if step % args.demo_every == 0:
