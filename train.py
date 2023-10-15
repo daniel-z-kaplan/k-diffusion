@@ -20,7 +20,7 @@ import torch._dynamo
 from torch import distributed as dist
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim, FloatTensor, BoolTensor, LongTensor
+from torch import optim, FloatTensor, LongTensor
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
@@ -33,7 +33,9 @@ from kdiff_trainer.make_captioned_grid import GridCaptioner, BBox, Typesetting, 
 from kdiff_trainer.xattn.precompute_conds import precompute_conds, PrecomputedConds
 from kdiff_trainer.xattn.precomputed_cond_cfg_args import get_precomputed_cond_cfg_args
 from kdiff_trainer.xattn.make_cfg_crossattn_model import make_cfg_crossattn_model_fn
+from kdiff_trainer.xattn.get_precomputed_conds_by_ix import get_precomputed_conds_by_ix
 from kdiff_trainer.xattn.crossattn_cfg_args import CrossAttnCFGArgs
+from kdiff_trainer.xattn.crossattn_extra_args import CrossAttnExtraArgs
 from kdiff_trainer.to_pil_images import to_pil_images
 
 def ensure_distributed():
@@ -554,17 +556,14 @@ def main():
                     reals, _, aug_cond = batch[image_key]
                     class_cond, extra_args = None, {}
                     if precomputed_conds is not None:
-                        drop = torch.rand(batch['embed_ix'].shape[0], device=accelerator.device)
-                        batch_text_embeds: FloatTensor = precomputed_conds.masked_conds.cond.index_select(0, batch['embed_ix'])
-                        batch_text_embeds[drop < cond_dropout_rate] = precomputed_conds.masked_conds.cond[precomputed_conds.text_uncond_ix]
-                        batch_text_embeds[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 0
-
-                        batch_token_masks: BoolTensor = precomputed_conds.masked_conds.mask.index_select(0, batch['embed_ix'])
-                        batch_token_masks[drop < cond_dropout_rate] = precomputed_conds.masked_conds.mask[precomputed_conds.text_uncond_ix]
-                        batch_token_masks[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 1
-
-                        extra_args['crossattn_cond'] = batch_text_embeds
-                        extra_args['crossattn_mask'] = batch_token_masks
+                        xattn_extra_args: CrossAttnExtraArgs = get_precomputed_conds_by_ix(
+                            device=accelerator.device,
+                            precomputed_conds=precomputed_conds,
+                            embed_ix=batch['embed_ix'],
+                            cond_dropout_rate=cond_dropout_rate,
+                            allzeros_uncond_rate=dataset_config['allzeros_uncond_rate'],
+                        )
+                        extra_args = {**extra_args, **xattn_extra_args}
                     elif num_classes:
                         class_cond = batch[class_key]
                         drop = torch.rand(class_cond.shape, device=class_cond.device)
