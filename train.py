@@ -20,13 +20,11 @@ import torch._dynamo
 from torch import distributed as dist
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim, FloatTensor, BoolTensor, ByteTensor, LongTensor
+from torch import optim, FloatTensor, BoolTensor, LongTensor
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
 from typing import List, Optional
-from numpy.typing import NDArray
-from functorch.einops import rearrange
 from PIL import Image, ImageFont
 
 import k_diffusion as K
@@ -36,6 +34,7 @@ from kdiff_trainer.xattn.precompute_conds import precompute_conds, PrecomputedCo
 from kdiff_trainer.xattn.precomputed_cond_cfg_args import get_precomputed_cond_cfg_args
 from kdiff_trainer.xattn.make_cfg_crossattn_model import make_cfg_crossattn_model_fn
 from kdiff_trainer.xattn.crossattn_cfg_args import CrossAttnCFGArgs
+from kdiff_trainer.to_pil_images import to_pil_images
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -443,15 +442,13 @@ def main():
         if accelerator.is_main_process:
             if uses_crossattn:
                 assert caption_ix is not None
-                rgb_imgs: ByteTensor = x_0.clamp(-1, 1).add(1).mul(127.5).byte()
-                imgs_np: NDArray = rearrange(rgb_imgs, 'b rgb row col -> b row col rgb').contiguous().cpu().numpy()
-                imgs: List[Image.Image] = [Image.fromarray(img, mode='RGB') for img in imgs_np]
+                pils: List[Image.Image] = to_pil_images(x_0)
                 captions: List[str] = [precomputed_conds.class_captions[caption_ix_.item()] for caption_ix_ in caption_ix.flatten().cpu()]
                 title = f'[step {step}] {args.name} {args.config}'
                 if args.demo_title_qualifier:
                     title += f' {args.demo_title_qualifier}'
                 grid_pil: Image.Image = captioner.__call__(
-                    imgs=imgs,
+                    imgs=pils,
                     captions=captions,
                     title=title,
                 )
