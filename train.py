@@ -18,10 +18,9 @@ import safetensors.torch as safetorch
 import torch
 import torch._dynamo
 from torch import distributed as dist
-from torch.distributed import Work
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim, LongTensor, FloatTensor, BoolTensor, ByteTensor, inference_mode
+from torch import optim, FloatTensor, BoolTensor, ByteTensor
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
@@ -33,6 +32,8 @@ from PIL import Image, ImageFont
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
 from kdiff_trainer.make_captioned_grid import GridCaptioner, BBox, Typesetting, make_grid_captioner, make_typesetting
+from kdiff_trainer.xattn.precompute_conds import precompute_conds, PrecomputedConds
+from kdiff_trainer.xattn.make_cfg_crossattn_model import make_cfg_crossattn_model_fn
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -174,91 +175,11 @@ def main():
     groups = inner_model.param_groups(lr)
     inner_model, inner_model_ema = accelerator.prepare(inner_model, inner_model_ema)
 
-    text_embeds: Optional[FloatTensor] = None
-    token_mask: Optional[BoolTensor] = None
-    text_uncond_ix = 0
-    if 'classes_to_captions' in dataset_config:
-        assert dataset_config['classes_to_captions'] == 'oxford-flowers'
-        from transformers import CLIPTextConfig
-        from kdiff_trainer.dataset_meta.oxford_flowers import flower_classes
-        uncond = ''
-        class_captions: List[str] = [uncond, *flower_classes]
-        
-        text_model_name = 'openai/clip-vit-large-patch14'
-        text_config: CLIPTextConfig = CLIPTextConfig.from_pretrained(
-            text_model_name,
-            cache_dir=args.text_model_hf_cache_dir,
-        )
-        max_length: int = text_config.max_position_embeddings
-
-        expected_embed_shape = torch.Size((len(class_captions), max_length, text_config.hidden_size))
-        expected_mask_shape = torch.Size((len(class_captions), max_length))
-
-        match(accelerator.mixed_precision):
-            case 'bf16':
-                embed_dtype = torch.bfloat16
-            case 'fp16':
-                embed_dtype = torch.float16
-            case 'fp8':
-                # seriously?
-                embed_dtype = torch.float8_e4m3fn
-            case _:
-                embed_dtype = torch.float32
-
-        if accelerator.is_main_process:
-            from transformers import CLIPTextModel, CLIPTokenizerFast
-            from transformers.modeling_outputs import BaseModelOutputWithPooling
-            from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, TensorType
-            text_model: CLIPTextModel = CLIPTextModel.from_pretrained(
-                text_model_name,
-                config=text_config,
-                cache_dir=args.text_model_hf_cache_dir,
-                use_safetensors=True,
-                torch_dtype=torch.float16,
-            ).to(accelerator.device).eval()
-            tokenizer: CLIPTokenizerFast = CLIPTokenizerFast.from_pretrained(text_model_name)
-            tokens_out: BatchEncoding = tokenizer(
-                class_captions,
-                return_tensors=TensorType.PYTORCH,
-                padding=PaddingStrategy.MAX_LENGTH,
-                max_length=max_length,
-                return_attention_mask=True,
-                return_length=True,
-                add_special_tokens=True,
-            )
-            tokens: LongTensor = tokens_out['input_ids'].to(accelerator.device)
-            token_mask: LongTensor = tokens_out['attention_mask'].to(accelerator.device, dtype=torch.bool)
-            del tokens_out, tokenizer
-            assert token_mask.shape == expected_mask_shape
-            # https://github.com/openai/CLIP/issues/183
-            # supposedly we shouldn't supply the token mask to CLIPTextEncoder -- OpenAI say
-            # that the causal mask is already enough to protect you from attending to padding?
-            # in fact, I certainly noticed with SDXL that supplying mask to CLIPTextEncoder gave me bad results:
-            # https://github.com/Birch-san/sdxl-play/blob/afabe5d173553511d0fd0d65c34dffb234745e69/src/embed_mgmt/embed.py#L24
-            with inference_mode():
-                encoder_out: BaseModelOutputWithPooling = text_model.forward(
-                    tokens,
-                    # attention_mask=token_mask,
-                    # we need it to give us access to penultimate hidden states
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-                del tokens
-                # these are penultimate hidden states
-                text_embeds: FloatTensor = encoder_out.hidden_states[-2].to(embed_dtype)
-                assert text_embeds.shape == expected_embed_shape
-                del encoder_out, text_model
-        else:
-            text_embeds: FloatTensor = torch.empty(expected_embed_shape, dtype=embed_dtype, device=accelerator.device)
-            token_mask: FloatTensor = torch.empty(expected_mask_shape, dtype=torch.bool, device=accelerator.device)
-        emb_handle: Work = dist.broadcast(text_embeds, 0, async_op=True)
-        mask_handle: Work = dist.broadcast(token_mask, 0, async_op=True)
-        emb_handle.wait()
-        mask_handle.wait()
-        emptystr_uncond: FloatTensor = text_embeds[text_uncond_ix].unsqueeze(0)
-        emptystr_uncond_mask: BoolTensor = token_mask[text_uncond_ix].unsqueeze(0)
-        allzeros_uncond: FloatTensor = torch.zeros_like(emptystr_uncond)
-        allzeros_uncond_mask: BoolTensor = torch.ones_like(emptystr_uncond_mask)
+    precomputed_conds: Optional[PrecomputedConds] = precompute_conds(
+        accelerator=accelerator,
+        dataset_config=dataset_config,
+        args=args,
+    ) if 'classes_to_captions' in dataset_config else None
 
     if opt_config['type'] == 'adamw':
         opt = optim.AdamW(groups,
@@ -484,19 +405,6 @@ def main():
             return cfg_model_fn
         return model
 
-    def make_cfg_crossattn_model_fn(model, xuncond: FloatTensor, xuncond_mask: BoolTensor):
-        def cfg_model_fn(x, sigma, xcond: FloatTensor, xcond_mask: BoolTensor):
-            x_in = torch.cat([x, x])
-            sigma_in = torch.cat([sigma, sigma])
-            xcond_in = torch.cat([xuncond, xcond])
-            xcond_mask_in = torch.cat([xuncond_mask, xcond_mask])
-            out: FloatTensor = model(x_in, sigma_in, crossattn_cond=xcond_in, crossattn_mask=xcond_mask_in)
-            out_uncond, out_cond = out.chunk(2)
-            return out_uncond + (out_cond - out_uncond) * cfg_scale
-        if cfg_scale != 1:
-            return cfg_model_fn
-        return model
-
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
     def demo(captioner: GridCaptioner):
@@ -510,23 +418,24 @@ def main():
         x = x[accelerator.process_index] * sigma_max
         model_fn, extra_args = model_ema, {}
         if uses_crossattn:
+            assert precomputed_conds is not None
             # btw 0th item in text_embeds is uncond. we (intentionally) may draw uncond samples.
             # these will have CFG applied, which is silly but free (in wall-time) since they coexist with batch items that legitimately need CFG
-            caption_ix = torch.randint(0, text_embeds.shape[0], [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
+            caption_ix = torch.randint(0, precomputed_conds.text_embeds.shape[0], [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(caption_ix, 0)
-            xcond: FloatTensor = text_embeds.index_select(0, caption_ix[accelerator.process_index])
-            xcond_mask: BoolTensor = token_mask.index_select(0, caption_ix[accelerator.process_index])
+            xcond: FloatTensor = precomputed_conds.text_embeds.index_select(0, caption_ix[accelerator.process_index])
+            xcond_mask: BoolTensor = precomputed_conds.token_mask.index_select(0, caption_ix[accelerator.process_index])
             if dataset_config['demo_uncond'] == 'allzeros':
-                xcond[caption_ix[accelerator.process_index] == text_uncond_ix] = 0
-                xcond_mask[caption_ix[accelerator.process_index] == text_uncond_ix] = 1
-                xuncond: FloatTensor = allzeros_uncond
-                xuncond_mask: BoolTensor = allzeros_uncond_mask
+                xcond[caption_ix[accelerator.process_index] == precomputed_conds.text_uncond_ix] = 0
+                xcond_mask[caption_ix[accelerator.process_index] == precomputed_conds.text_uncond_ix] = 1
+                xuncond: FloatTensor = precomputed_conds.allzeros_uncond
+                xuncond_mask: BoolTensor = precomputed_conds.allzeros_uncond_mask
             elif dataset_config['demo_uncond'] == 'emptystr':
-                xuncond: FloatTensor = emptystr_uncond
-                xuncond_mask: BoolTensor = emptystr_uncond_mask
+                xuncond: FloatTensor = precomputed_conds.emptystr_uncond
+                xuncond_mask: BoolTensor = precomputed_conds.emptystr_uncond_mask
             extra_args['crossattn_cond'] = xcond
             extra_args['crossattn_mask'] = xcond_mask
-            model_fn = make_cfg_crossattn_model_fn(model_ema, xuncond=xuncond, xuncond_mask=xuncond_mask)
+            model_fn = make_cfg_crossattn_model_fn(model_ema, xuncond=xuncond, xuncond_mask=xuncond_mask, cfg_scale=cfg_scale)
         elif num_classes:
             class_cond = torch.randint(0, num_classes, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(class_cond, 0)
@@ -540,7 +449,7 @@ def main():
                 rgb_imgs: ByteTensor = x_0.clamp(-1, 1).add(1).mul(127.5).byte()
                 imgs_np: NDArray = rearrange(rgb_imgs, 'b rgb row col -> b row col rgb').contiguous().cpu().numpy()
                 imgs: List[Image.Image] = [Image.fromarray(img, mode='RGB') for img in imgs_np]
-                captions: List[str] = [class_captions[caption_ix_.item()] for caption_ix_ in caption_ix.flatten().cpu()]
+                captions: List[str] = [precomputed_conds.class_captions[caption_ix_.item()] for caption_ix_ in caption_ix.flatten().cpu()]
                 title = f'[step {step}] {args.name} {args.config}'
                 if args.demo_title_qualifier:
                     title += f' {args.demo_title_qualifier}'
@@ -638,14 +547,14 @@ def main():
                 with accelerator.accumulate(model):
                     reals, _, aug_cond = batch[image_key]
                     class_cond, extra_args = None, {}
-                    if text_embeds is not None:
+                    if precomputed_conds is not None:
                         drop = torch.rand(batch['embed_ix'].shape[0], device=accelerator.device)
-                        batch_text_embeds: FloatTensor = text_embeds.index_select(0, batch['embed_ix'])
-                        batch_text_embeds[drop < cond_dropout_rate] = text_embeds[text_uncond_ix]
+                        batch_text_embeds: FloatTensor = precomputed_conds.text_embeds.index_select(0, batch['embed_ix'])
+                        batch_text_embeds[drop < cond_dropout_rate] = precomputed_conds.text_embeds[precomputed_conds.text_uncond_ix]
                         batch_text_embeds[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 0
 
-                        batch_token_masks: BoolTensor = token_mask.index_select(0, batch['embed_ix'])
-                        batch_token_masks[drop < cond_dropout_rate] = token_mask[text_uncond_ix]
+                        batch_token_masks: BoolTensor = precomputed_conds.token_mask.index_select(0, batch['embed_ix'])
+                        batch_token_masks[drop < cond_dropout_rate] = precomputed_conds.token_mask[precomputed_conds.text_uncond_ix]
                         batch_token_masks[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 1
 
                         extra_args['crossattn_cond'] = batch_text_embeds
