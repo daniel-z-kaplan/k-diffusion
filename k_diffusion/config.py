@@ -2,6 +2,7 @@ from functools import partial
 import json
 import math
 from pathlib import Path
+from typing import Dict, Union
 
 from jsonmerge import merge
 
@@ -20,7 +21,7 @@ def round_to_power_of_two(x, tol):
     return approxs[0]
 
 
-def load_config(path_or_dict):
+def load_config(path_or_dict: Union[str, Dict], use_json5=False):
     defaults_image_v1 = {
         'model': {
             'patch_size': 1,
@@ -110,11 +111,17 @@ def load_config(path_or_dict):
         file = Path(path_or_dict)
         if file.suffix == '.safetensors':
             metadata = utils.get_safetensors_metadata(file)
-            config = json.loads(metadata['config'])
+            json_str: str = metadata['config']
         else:
-            config = json.loads(file.read_text())
+            json_str: str = file.read_text()
+        if use_json5:
+            # json5 supports comments, like in .jsonc files
+            import json5
+            config: Dict = json5.loads(json_str)
+        else:
+            config: Dict = json.loads(json_str)
     else:
-        config = path_or_dict
+        config: Dict = path_or_dict
     if config['model']['type'] == 'image_v1':
         config = merge(defaults_image_v1, config)
     elif config['model']['type'] == 'image_transformer_v1':
