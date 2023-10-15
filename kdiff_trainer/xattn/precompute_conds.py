@@ -8,16 +8,15 @@ from argparse import Namespace
 from dataclasses import dataclass
 import gc
 
+from .masked_cond import MaskedCond
+
 @dataclass
 class PrecomputedConds:
     text_uncond_ix: int
     class_captions: List[str]
-    text_embeds: FloatTensor
-    token_mask: BoolTensor
-    emptystr_uncond: FloatTensor
-    emptystr_uncond_mask: BoolTensor
-    allzeros_uncond: FloatTensor
-    allzeros_uncond_mask: BoolTensor
+    masked_conds: MaskedCond
+    emptystr_masked_uncond: MaskedCond
+    allzeros_masked_uncond: MaskedCond
 
 def precompute_conds(
     accelerator: Accelerator,
@@ -111,13 +110,23 @@ def precompute_conds(
     gc.collect()
     torch.cuda.empty_cache()
 
+    masked_conds = MaskedCond(
+        cond=text_embeds,
+        mask=token_mask,
+    )
+    emptystr_masked_uncond = MaskedCond(
+        cond=emptystr_uncond,
+        mask=emptystr_uncond_mask,
+    )
+    allzeros_masked_uncond = MaskedCond(
+        cond=allzeros_uncond,
+        mask=allzeros_uncond_mask,
+    )
+
     return PrecomputedConds(
         text_uncond_ix=text_uncond_ix,
         class_captions=class_captions,
-        text_embeds=text_embeds,
-        token_mask=token_mask,
-        emptystr_uncond=emptystr_uncond,
-        emptystr_uncond_mask=emptystr_uncond_mask,
-        allzeros_uncond=allzeros_uncond,
-        allzeros_uncond_mask=allzeros_uncond_mask,
+        masked_conds=masked_conds,
+        emptystr_masked_uncond=emptystr_masked_uncond,
+        allzeros_masked_uncond=allzeros_masked_uncond,
     )

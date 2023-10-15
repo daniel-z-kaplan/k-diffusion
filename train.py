@@ -20,7 +20,7 @@ import torch._dynamo
 from torch import distributed as dist
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim, FloatTensor, BoolTensor, ByteTensor
+from torch import optim, FloatTensor, BoolTensor, ByteTensor, LongTensor
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
@@ -33,7 +33,9 @@ import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
 from kdiff_trainer.make_captioned_grid import GridCaptioner, BBox, Typesetting, make_grid_captioner, make_typesetting
 from kdiff_trainer.xattn.precompute_conds import precompute_conds, PrecomputedConds
+from kdiff_trainer.xattn.precomputed_cond_cfg_args import get_precomputed_cond_cfg_args
 from kdiff_trainer.xattn.make_cfg_crossattn_model import make_cfg_crossattn_model_fn
+from kdiff_trainer.xattn.crossattn_cfg_args import CrossAttnCFGArgs
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -417,25 +419,19 @@ def main():
         dist.broadcast(x, 0)
         x = x[accelerator.process_index] * sigma_max
         model_fn, extra_args = model_ema, {}
+        caption_ix: Optional[LongTensor] = None
         if uses_crossattn:
             assert precomputed_conds is not None
-            # btw 0th item in text_embeds is uncond. we (intentionally) may draw uncond samples.
-            # these will have CFG applied, which is silly but free (in wall-time) since they coexist with batch items that legitimately need CFG
-            caption_ix = torch.randint(0, precomputed_conds.text_embeds.shape[0], [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
-            dist.broadcast(caption_ix, 0)
-            xcond: FloatTensor = precomputed_conds.text_embeds.index_select(0, caption_ix[accelerator.process_index])
-            xcond_mask: BoolTensor = precomputed_conds.token_mask.index_select(0, caption_ix[accelerator.process_index])
-            if dataset_config['demo_uncond'] == 'allzeros':
-                xcond[caption_ix[accelerator.process_index] == precomputed_conds.text_uncond_ix] = 0
-                xcond_mask[caption_ix[accelerator.process_index] == precomputed_conds.text_uncond_ix] = 1
-                xuncond: FloatTensor = precomputed_conds.allzeros_uncond
-                xuncond_mask: BoolTensor = precomputed_conds.allzeros_uncond_mask
-            elif dataset_config['demo_uncond'] == 'emptystr':
-                xuncond: FloatTensor = precomputed_conds.emptystr_uncond
-                xuncond_mask: BoolTensor = precomputed_conds.emptystr_uncond_mask
-            extra_args['crossattn_cond'] = xcond
-            extra_args['crossattn_mask'] = xcond_mask
-            model_fn = make_cfg_crossattn_model_fn(model_ema, xuncond=xuncond, xuncond_mask=xuncond_mask, cfg_scale=cfg_scale)
+            cfg_args: CrossAttnCFGArgs = get_precomputed_cond_cfg_args(
+                accelerator=accelerator,
+                precomputed_conds=precomputed_conds,
+                demo_uncond=dataset_config['demo_uncond'],
+                n_per_proc=n_per_proc,
+                demo_gen=demo_gen,
+            )
+            caption_ix = cfg_args.caption_ix
+            extra_args = {**extra_args, **cfg_args.sampling_extra_args}
+            model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=cfg_args.masked_uncond, cfg_scale=cfg_scale)
         elif num_classes:
             class_cond = torch.randint(0, num_classes, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(class_cond, 0)
@@ -446,6 +442,7 @@ def main():
         x_0 = accelerator.gather(x_0)[:args.sample_n]
         if accelerator.is_main_process:
             if uses_crossattn:
+                assert caption_ix is not None
                 rgb_imgs: ByteTensor = x_0.clamp(-1, 1).add(1).mul(127.5).byte()
                 imgs_np: NDArray = rearrange(rgb_imgs, 'b rgb row col -> b row col rgb').contiguous().cpu().numpy()
                 imgs: List[Image.Image] = [Image.fromarray(img, mode='RGB') for img in imgs_np]
@@ -549,12 +546,12 @@ def main():
                     class_cond, extra_args = None, {}
                     if precomputed_conds is not None:
                         drop = torch.rand(batch['embed_ix'].shape[0], device=accelerator.device)
-                        batch_text_embeds: FloatTensor = precomputed_conds.text_embeds.index_select(0, batch['embed_ix'])
-                        batch_text_embeds[drop < cond_dropout_rate] = precomputed_conds.text_embeds[precomputed_conds.text_uncond_ix]
+                        batch_text_embeds: FloatTensor = precomputed_conds.masked_conds.cond.index_select(0, batch['embed_ix'])
+                        batch_text_embeds[drop < cond_dropout_rate] = precomputed_conds.masked_conds.cond[precomputed_conds.text_uncond_ix]
                         batch_text_embeds[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 0
 
-                        batch_token_masks: BoolTensor = precomputed_conds.token_mask.index_select(0, batch['embed_ix'])
-                        batch_token_masks[drop < cond_dropout_rate] = precomputed_conds.token_mask[precomputed_conds.text_uncond_ix]
+                        batch_token_masks: BoolTensor = precomputed_conds.masked_conds.mask.index_select(0, batch['embed_ix'])
+                        batch_token_masks[drop < cond_dropout_rate] = precomputed_conds.masked_conds.mask[precomputed_conds.text_uncond_ix]
                         batch_token_masks[drop < cond_dropout_rate * dataset_config['allzeros_uncond_rate']] = 1
 
                         extra_args['crossattn_cond'] = batch_text_embeds

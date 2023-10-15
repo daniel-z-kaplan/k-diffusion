@@ -1,7 +1,10 @@
 import torch
 from torch import FloatTensor, BoolTensor
 
-def make_cfg_crossattn_model_fn(model, xuncond: FloatTensor, xuncond_mask: BoolTensor, cfg_scale: int):
+from .masked_cond import MaskedCond
+
+def make_cfg_crossattn_model_fn(model, masked_uncond: MaskedCond, cfg_scale: int):
+    xuncond, xuncond_mask = masked_uncond
     def cfg_model_fn(x, sigma, xcond: FloatTensor, xcond_mask: BoolTensor):
         x_in = torch.cat([x, x])
         sigma_in = torch.cat([sigma, sigma])
