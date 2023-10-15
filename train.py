@@ -106,6 +106,8 @@ def main():
                    help='the multiprocessing start method')
     p.add_argument('--text-model-hf-cache-dir', type=str, default=None,
                    help='disk directory into which HF should download text model checkpoints')
+    p.add_argument('--text-model-trust-remote-code', action='store_true',
+                   help="whether to access model code via HF's Code on Hub feature (required for text encoders such as Phi)")
     p.add_argument('--font', type=str, default='./kdiff_trainer/font/DejaVuSansMono.ttf',
                    help='font used for drawing demo grids (e.g. /usr/share/fonts/dejavu/DejaVuSansMono.ttf or ./kdiff_trainer/font/DejaVuSansMono.ttf). Pass empty string for ImageFont.load_default().')
     p.add_argument('--demo-title-qualifier', type=str, default=None,
@@ -158,6 +160,15 @@ def main():
     demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
     elapsed = 0.0
 
+    uses_crossattn: bool = 'cross_attn' in model_config and model_config['cross_attn']
+    precomputed_conds: Optional[PrecomputedConds] = precompute_conds(
+        accelerator=accelerator,
+        classes_to_captions=dataset_config['classes_to_captions'],
+        encoder=model_config['cross_attn']['encoder'],
+        trust_remote_code=args.text_model_trust_remote_code,
+        hf_cache_dir=args.text_model_hf_cache_dir,
+    ) if uses_crossattn and 'classes_to_captions' in dataset_config else None
+
     inner_model = K.config.make_model(config)
     inner_model_ema = deepcopy(inner_model)
 
@@ -180,12 +191,6 @@ def main():
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
     inner_model, inner_model_ema = accelerator.prepare(inner_model, inner_model_ema)
-
-    precomputed_conds: Optional[PrecomputedConds] = precompute_conds(
-        accelerator=accelerator,
-        dataset_config=dataset_config,
-        args=args,
-    ) if 'classes_to_captions' in dataset_config else None
 
     if opt_config['type'] == 'adamw':
         opt = optim.AdamW(groups,
@@ -231,7 +236,6 @@ def main():
                                   max_value=ema_sched_config['max_value'])
     ema_stats = {}
 
-    uses_crossattn: bool = 'cross_attn' in model_config and model_config['cross_attn']
     if uses_crossattn:
         assert 'demo_uncond' in dataset_config
         assert dataset_config['demo_uncond'] == 'allzeros' or dataset_config['demo_uncond'] == 'emptystr'

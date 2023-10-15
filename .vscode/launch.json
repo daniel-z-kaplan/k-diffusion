@@ -155,6 +155,7 @@
         "--mixed-precision", "bf16",
         "--start-method", "fork",
         "--demo-img-compress",
+        "--text-model-trust-remote-code",
         "--font", "./kdiff_trainer/font/DejaVuSansMono.ttf",
       ],
       "env": {

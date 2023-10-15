@@ -12,8 +12,8 @@
             {"type": "global", "d_head": 64}
         ],
         "cross_attn": {
-            // "encoder": "phi-1-5",
-            "encoder": "clip-vit-l",
+            "encoder": "phi-1-5",
+            // "encoder": "clip-vit-l",
             "dropout": 0.1,
             "scale_qk": true,
             "layers": [

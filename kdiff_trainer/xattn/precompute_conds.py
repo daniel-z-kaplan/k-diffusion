@@ -1,13 +1,14 @@
-from typing import List
+from typing import List, Optional
 import torch
 from torch import LongTensor, FloatTensor, BoolTensor, inference_mode
 from torch import distributed as dist
+from torch.nn import Sequential
 from torch.distributed import Work
 from accelerate import Accelerator
-from argparse import Namespace
 from dataclasses import dataclass
 import gc
 
+# from ..iteration.batched import batched
 from .masked_cond import MaskedCond
 
 @dataclass
@@ -20,24 +21,43 @@ class PrecomputedConds:
 
 def precompute_conds(
     accelerator: Accelerator,
-    dataset_config,
-    args: Namespace,
+    classes_to_captions: str,
+    encoder: str,
+    trust_remote_code = False,
+    hf_cache_dir: Optional[str] = None,
 ) -> PrecomputedConds:
-    assert dataset_config['classes_to_captions'] == 'oxford-flowers'
-    from transformers import CLIPTextConfig
+    assert classes_to_captions == 'oxford-flowers'
+    from transformers import CLIPTextConfig, AutoConfig, PretrainedConfig
     from kdiff_trainer.dataset_meta.oxford_flowers import flower_classes
     text_uncond_ix = 0
     uncond = ''
     class_captions: List[str] = [uncond, *flower_classes]
 
-    text_model_name = 'openai/clip-vit-large-patch14'
-    text_config: CLIPTextConfig = CLIPTextConfig.from_pretrained(
-        text_model_name,
-        cache_dir=args.text_model_hf_cache_dir,
-    )
-    max_length: int = text_config.max_position_embeddings
+    text_model_dtype = torch.bfloat16
 
-    expected_embed_shape = torch.Size((len(class_captions), max_length, text_config.hidden_size))
+    match encoder:
+        case 'clip-vit-l':
+            text_model_name = 'openai/clip-vit-large-patch14'
+            text_config: CLIPTextConfig = CLIPTextConfig.from_pretrained(
+                text_model_name,
+                cache_dir=hf_cache_dir,
+            )
+            max_length: int = text_config.max_position_embeddings
+            hidden_size: int = text_config.hidden_size
+        case 'phi-1-5':
+            text_model_name = 'microsoft/phi-1_5'
+            text_config: PretrainedConfig = AutoConfig.from_pretrained(
+                text_model_name,
+                cache_dir=hf_cache_dir,
+                # I don't know why they insist on trust_remote_code even for reading config
+                trust_remote_code=trust_remote_code,
+            )
+            max_length: int = text_config.n_positions
+            hidden_size: int = text_config.n_embd
+        case _:
+            raise ValueError(f"Never heard of cross-attn encoder '{encoder}'")
+
+    expected_embed_shape = torch.Size((len(class_captions), max_length, hidden_size))
     expected_mask_shape = torch.Size((len(class_captions), max_length))
 
     match(accelerator.mixed_precision):
@@ -52,17 +72,47 @@ def precompute_conds(
             embed_dtype = torch.float32
 
     if accelerator.is_main_process:
-        from transformers import CLIPTextModel, CLIPTokenizerFast
+        from transformers import (
+            CLIPTextModel,
+            CLIPTokenizerFast,
+            AutoModelForCausalLM,
+            PreTrainedModel,
+            CodeGenTokenizerFast,
+        )
         from transformers.modeling_outputs import BaseModelOutputWithPooling
         from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, TensorType
-        text_model: CLIPTextModel = CLIPTextModel.from_pretrained(
-            text_model_name,
-            config=text_config,
-            cache_dir=args.text_model_hf_cache_dir,
-            use_safetensors=True,
-            torch_dtype=torch.float16,
-        ).to(accelerator.device).eval()
-        tokenizer: CLIPTokenizerFast = CLIPTokenizerFast.from_pretrained(text_model_name)
+        model_kwargs_common = {
+            'config': text_config,
+            'cache_dir': hf_cache_dir,
+            'torch_dtype': text_model_dtype,
+        }
+        match encoder:
+            case 'clip-vit-l':
+                text_model: CLIPTextModel = CLIPTextModel.from_pretrained(
+                    text_model_name,
+                    **model_kwargs_common,
+                    use_safetensors=True,
+                ).to(accelerator.device).eval()
+                tokenizer: CLIPTokenizerFast = CLIPTokenizerFast.from_pretrained(text_model_name)
+                # https://github.com/openai/CLIP/issues/183
+                # supposedly we shouldn't supply the token mask to CLIPTextEncoder -- OpenAI say
+                # that the causal mask is already enough to protect you from attending to padding?
+                # in fact, I certainly noticed with SDXL that supplying mask to CLIPTextEncoder gave me bad results:
+                # https://github.com/Birch-san/sdxl-play/blob/afabe5d173553511d0fd0d65c34dffb234745e69/src/embed_mgmt/embed.py#L24
+                pass_mask_to_encoder = False
+            case 'phi-1-5':
+                text_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+                    text_model_name,
+                    **model_kwargs_common,
+                    trust_remote_code=trust_remote_code,
+                    # no safetensors available at the time of writing
+                ).to(accelerator.device).eval()
+                tokenizer: CodeGenTokenizerFast = CodeGenTokenizerFast.from_pretrained(text_model_name)
+                # Phi's tokenizer doesn't define a PAD token, but we need one in order to tokenize in batches.
+                tokenizer.pad_token = tokenizer.eos_token
+                pass_mask_to_encoder = True
+            case _:
+                raise ValueError(f"Never heard of cross-attn encoder '{encoder}'")
         tokens_out: BatchEncoding = tokenizer(
             class_captions,
             return_tensors=TensorType.PYTORCH,
@@ -76,24 +126,35 @@ def precompute_conds(
         token_mask: LongTensor = tokens_out['attention_mask'].to(accelerator.device, dtype=torch.bool)
         del tokens_out, tokenizer
         assert token_mask.shape == expected_mask_shape
-        # https://github.com/openai/CLIP/issues/183
-        # supposedly we shouldn't supply the token mask to CLIPTextEncoder -- OpenAI say
-        # that the causal mask is already enough to protect you from attending to padding?
-        # in fact, I certainly noticed with SDXL that supplying mask to CLIPTextEncoder gave me bad results:
-        # https://github.com/Birch-san/sdxl-play/blob/afabe5d173553511d0fd0d65c34dffb234745e69/src/embed_mgmt/embed.py#L24
         with inference_mode():
-            encoder_out: BaseModelOutputWithPooling = text_model.forward(
-                tokens,
-                # attention_mask=token_mask,
-                # we need it to give us access to penultimate hidden states
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            del tokens
-            # these are penultimate hidden states
-            text_embeds: FloatTensor = encoder_out.hidden_states[-2].to(embed_dtype)
+            if encoder == 'phi-1-5':
+                # for some reason their model code doesn't use flash attn
+                batch_size = 32
+                layers: Sequential = text_model.layers
+                first, *rest = layers
+                text_embeds: Optional[FloatTensor] = None
+                for tokens_, token_mask_ in zip(torch.split(tokens, batch_size), torch.split(token_mask, batch_size)):
+                    # for some reason they don't provide any API which outputs hidden states
+                    hidden_states: FloatTensor = first(tokens_)
+                    # we deliberately stop at -2 instead of -1 because we want penultimate hidden states
+                    for module in rest[:-2]:
+                        hidden_states: FloatTensor = module(hidden_states, past_key_values=None, attention_mask=token_mask_)
+                    hidden_states = hidden_states.to(embed_dtype)
+                    text_embeds = hidden_states if text_embeds is None else torch.cat([text_embeds, hidden_states])
+                del hidden_states
+            else:
+                encoder_out: BaseModelOutputWithPooling = text_model.forward(
+                    tokens,
+                    attention_mask=token_mask if pass_mask_to_encoder else None,
+                    # we need it to give us access to penultimate hidden states
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                # these are penultimate hidden states
+                text_embeds: FloatTensor = encoder_out.hidden_states[-2].to(embed_dtype)
+                del encoder_out
             assert text_embeds.shape == expected_embed_shape
-            del encoder_out, text_model
+            del tokens, text_model
     else:
         text_embeds: FloatTensor = torch.empty(expected_embed_shape, dtype=embed_dtype, device=accelerator.device)
         token_mask: BoolTensor = torch.empty(expected_mask_shape, dtype=torch.bool, device=accelerator.device)
