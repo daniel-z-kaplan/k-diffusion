@@ -141,7 +141,7 @@ def precompute_conds(
                         hidden_states: FloatTensor = module(hidden_states, past_key_values=None, attention_mask=token_mask_)
                     hidden_states = hidden_states.to(embed_dtype)
                     text_embeds = hidden_states if text_embeds is None else torch.cat([text_embeds, hidden_states])
-                del hidden_states
+                del hidden_states, layers, first, rest
             else:
                 encoder_out: BaseModelOutputWithPooling = text_model.forward(
                     tokens,
