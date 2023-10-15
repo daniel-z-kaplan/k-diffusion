@@ -231,7 +231,7 @@ def main():
                                   max_value=ema_sched_config['max_value'])
     ema_stats = {}
 
-    uses_crossattn: bool = 'cross_attns' in model_config and model_config['cross_attns']
+    uses_crossattn: bool = 'cross_attn' in model_config and model_config['cross_attn']
     if uses_crossattn:
         assert 'demo_uncond' in dataset_config
         assert dataset_config['demo_uncond'] == 'allzeros' or dataset_config['demo_uncond'] == 'emptystr'

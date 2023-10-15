@@ -185,9 +185,22 @@ def make_model(config):
         assert len(config['widths']) == len(config['depths'])
         assert len(config['widths']) == len(config['d_ffs'])
         assert len(config['widths']) == len(config['self_attns'])
-        cross_attns = config['cross_attns'] if 'cross_attns' in config else [None]*len(config['widths'])
+        cross_attn = config['cross_attn'] if 'cross_attn' in config else None
+        if cross_attn is None:
+            d_cross = xattn_scale_qk = xattn_dropout = None
+        else:
+            xattn_scale_qk=cross_attn.get('scale_qk', True)
+            xattn_dropout=cross_attn.get('dropout', .1)
+            match(cross_attn['encoder']):
+                case 'clip-vit-l':
+                    d_cross = 768
+                case 'phi-1-5':
+                    d_cross = 2048
+                case _:
+                    raise ValueError(f"Never heard of cross-attn encoder '{cross_attn['encoder']}'")
+        cross_attn_layers = [None]*len(config['widths']) if cross_attn is None else cross_attn['layers']
         levels = []
-        for depth, width, d_ff, self_attn, cross_attn in zip(config['depths'], config['widths'], config['d_ffs'], config['self_attns'], cross_attns):
+        for depth, width, d_ff, self_attn, cross_attn_layer in zip(config['depths'], config['widths'], config['d_ffs'], config['self_attns'], cross_attn_layers):
             if self_attn['type'] == 'global':
                 self_attn = models.image_transformer_v2.GlobalAttentionSpec(self_attn.get('d_head', 64))
             elif self_attn['type'] == 'neighborhood':
@@ -198,9 +211,14 @@ def make_model(config):
                 self_attn = models.image_transformer_v2.NoAttentionSpec()
             else:
                 raise ValueError(f'unsupported self attention type {self_attn["type"]}')
-            if cross_attn is not None:
-                cross_attn = models.image_transformer_v2.CrossAttentionSpec(cross_attn.get('d_head', 64), cross_attn.get('d_cross', 768), cross_attn.get('scale_qk', True), cross_attn.get('dropout', .1))
-            levels.append(models.image_transformer_v2.LevelSpec(depth, width, d_ff, self_attn, cross_attn))
+            if cross_attn_layer is not None:
+                cross_attn_spec = models.image_transformer_v2.CrossAttentionSpec(
+                    d_head=cross_attn_layer.get('d_head', 64),
+                    d_cross=d_cross,
+                    scale_qk=xattn_scale_qk,
+                    dropout=xattn_dropout,
+                )
+            levels.append(models.image_transformer_v2.LevelSpec(depth, width, d_ff, self_attn, cross_attn_spec))
         mapping = models.image_transformer_v2.MappingSpec(config['mapping_depth'], config['mapping_width'], config['mapping_d_ff'])
         model = models.ImageTransformerDenoiserModelV2(
             levels=levels,

@@ -115,7 +115,7 @@
       "justMyCode": true,
       "subProcess": false,
       "args": [
-        "--config", "configs/config_oxford_flowers_crossattn.json",
+        "--config", "configs/config_oxford_flowers_crossattn.jsonc",
         "--out-root", "out",
         "--output-to-subdir",
         "--name", "flowers_demo_xattn_001",
@@ -144,7 +144,7 @@
       "args": [
         "--config_file", "/p/project/ccstdl/birch1/.cache/huggingface/accelerate/ddp.yaml",
         "train.py",
-        "--config", "configs/config_oxford_flowers_crossattn.json",
+        "--config", "configs/config_oxford_flowers_crossattn.jsonc",
         "--out-root", "out",
         "--output-to-subdir",
         "--name", "flowers_demo_xattn_accelerate_001",
