@@ -129,7 +129,8 @@ def main():
     except AttributeError:
         pass
 
-    config = K.config.load_config(args.config)
+    # use json5 parser if we wish to load .jsonc (commented) config
+    config = K.config.load_config(args.config, use_json5=args.config.endswith('.jsonc'))
     model_config = config['model']
     dataset_config = config['dataset']
     opt_config = config['optimizer']
