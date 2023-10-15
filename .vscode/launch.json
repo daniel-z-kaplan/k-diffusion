@@ -119,7 +119,6 @@
         "--out-root", "out",
         "--output-to-subdir",
         "--name", "flowers_demo_xattn_001",
-        "--save-every", "500",
         "--evaluate-n", "0",
         "--batch-size", "32",
         "--sample-n", "36",
