@@ -10,22 +10,38 @@ import math
 import json
 from pathlib import Path
 import time
+from os import makedirs
+from os.path import relpath
 
 import accelerate
 import safetensors.torch as safetorch
 import torch
 import torch._dynamo
 from torch import distributed as dist
+from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim
+from torch import optim, FloatTensor, LongTensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
+from typing import List, Optional
+from PIL import Image
 from typing import Optional
 
 import k_diffusion as K
+from k_diffusion.utils import DataSetTransform, BatchData
+from kdiff_trainer.dimensions import Dimensions
+from kdiff_trainer.make_default_grid_captioner import make_default_grid_captioner
+from kdiff_trainer.make_captioned_grid import GridCaptioner
+from kdiff_trainer.xattn.precompute_conds import precompute_conds, PrecomputedConds
+from kdiff_trainer.xattn.precomputed_cond_cfg_args import get_precomputed_cond_cfg_args
+from kdiff_trainer.xattn.make_cfg_crossattn_model import make_cfg_crossattn_model_fn
+from kdiff_trainer.xattn.get_precomputed_conds_by_ix import get_precomputed_conds_by_ix
+from kdiff_trainer.xattn.crossattn_cfg_args import CrossAttnCFGArgs
+from kdiff_trainer.xattn.crossattn_extra_args import CrossAttnExtraArgs
+from kdiff_trainer.to_pil_images import to_pil_images
 
 
 def ensure_distributed():
@@ -47,6 +63,10 @@ def main():
                    help='compile the model')
     p.add_argument('--config', type=str, required=True,
                    help='the configuration file')
+    p.add_argument('--out-root', type=str, default='.',
+                   help='outputs (checkpoints, demo samples, state, metrics) will be saved under this directory')
+    p.add_argument('--output-to-subdir', action='store_true',
+                   help='for outputs (checkpoints, demo samples, state, metrics): whether to use {{out_root}}/{{name}}/ subdirectories. When True: saves/loads from/to {{out_root}}/{{name}}/[{{product}}/]*, ({{product}}/ subdirectories are used for demo samples and checkpoints). When False: saves/loads from/to {{out_root}}/{{name}}_*')
     p.add_argument('--demo-every', type=int, default=500,
                    help='save a demo grid every this many steps')
     p.add_argument('--dinov2-model', type=str, default='vitl14',
@@ -92,6 +112,16 @@ def main():
     p.add_argument('--start-method', type=str, default='spawn',
                    choices=['fork', 'forkserver', 'spawn'],
                    help='the multiprocessing start method')
+    p.add_argument('--text-model-hf-cache-dir', type=str, default=None,
+                   help='disk directory into which HF should download text model checkpoints')
+    p.add_argument('--text-model-trust-remote-code', action='store_true',
+                   help="whether to access model code via HF's Code on Hub feature (required for text encoders such as Phi)")
+    p.add_argument('--font', type=str, default='./kdiff_trainer/font/DejaVuSansMono.ttf',
+                   help='font used for drawing demo grids (e.g. /usr/share/fonts/dejavu/DejaVuSansMono.ttf or ./kdiff_trainer/font/DejaVuSansMono.ttf). Pass empty string for ImageFont.load_default().')
+    p.add_argument('--demo-title-qualifier', type=str, default=None,
+                   help='Additional text to include in title printed in demo grids')
+    p.add_argument('--demo-img-compress', action='store_true',
+                   help='Demo image file format. False: .png; True: .jpg')
     p.add_argument('--wandb-entity', type=str,
                    help='the wandb entity name')
     p.add_argument('--wandb-group', type=str,
@@ -113,7 +143,8 @@ def main():
     if args.inference_only and args.evaluate_only:
         raise ValueError('Cannot fulfil both --inference-only and --evaluate-only; they are mutually-exclusive')
 
-    config = K.config.load_config(args.config)
+    # use json5 parser if we wish to load .jsonc (commented) config
+    config = K.config.load_config(args.config, use_json5=args.config.endswith('.jsonc'))
     model_config = config['model']
     dataset_config = config['dataset']
     if do_train:
@@ -142,6 +173,19 @@ def main():
         torch.manual_seed(seeds[accelerator.process_index])
     demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
     elapsed = 0.0
+
+    uses_crossattn: bool = 'cross_attn' in model_config and model_config['cross_attn']
+    if uses_crossattn:
+        assert 'demo_uncond' in dataset_config
+        assert dataset_config['demo_uncond'] == 'allzeros' or dataset_config['demo_uncond'] == 'emptystr'
+
+    precomputed_conds: Optional[PrecomputedConds] = precompute_conds(
+        accelerator=accelerator,
+        classes_to_captions=dataset_config['classes_to_captions'],
+        encoder=model_config['cross_attn']['encoder'],
+        trust_remote_code=args.text_model_trust_remote_code,
+        hf_cache_dir=args.text_model_hf_cache_dir,
+    ) if uses_crossattn and 'classes_to_captions' in dataset_config else None
 
     if model_config['type'] == 'guided_diffusion':
         from kdiff_trainer.load_diffusion_model import construct_diffusion_model
@@ -176,6 +220,8 @@ def main():
     if do_train:
         lr = opt_config['lr'] if args.lr is None else args.lr
         groups = inner_model.param_groups(lr)
+        # for FSDP support: models must be prepared separately and before optimizers
+        inner_model, inner_model_ema = accelerator.prepare(inner_model, inner_model_ema)
         if opt_config['type'] == 'adamw':
             opt = optim.AdamW(groups,
                             lr=lr,
@@ -221,6 +267,8 @@ def main():
         opt: Optional[Optimizer] = None
         sched: Optional[LRScheduler] = None
         ema_sched: Optional[K.utils.EMAWarmup] = None
+        # for FSDP support: model must be prepared separately and before optimizers
+        inner_model_ema = accelerator.prepare(inner_model_ema)
 
     tf = transforms.Compose([
         transforms.Resize(size[0], interpolation=transforms.InterpolationMode.BICUBIC),
@@ -239,7 +287,28 @@ def main():
     elif dataset_config['type'] == 'huggingface':
         from datasets import load_dataset
         train_set = load_dataset(dataset_config['location'])
-        train_set.set_transform(partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key']))
+        ds_transforms: List[DataSetTransform] = []
+        if uses_crossattn:
+            if 'classes_to_captions' in dataset_config:
+                assert dataset_config['classes_to_captions'] == 'oxford-flowers'
+                from kdiff_trainer.dataset_meta.oxford_flowers import ordinal_to_lexical
+                def embed_ix_extractor(batch: BatchData) -> BatchData:
+                    labels_ordinal: List[int] = batch['label']
+                    # labels_ordinal is 1-indexed.
+                    # the conds in text_embeds happen to be 1-indexed too, because we inserted an uncond embed at index 0
+                    # had we not embedded an uncond at index 0, we would need to adapt labels_ordinal's 1-index to text_embeds' 0-index:
+                    # labels_lexical_zeroix: List[int] = [ordinal_to_lexical[o]-1 for o in labels_ordinal]
+                    labels_lexical: List[int] = [ordinal_to_lexical[o] for o in labels_ordinal]
+                    return { 'embed_ix': labels_lexical }
+                ds_transforms.append(embed_ix_extractor)
+            else:
+                def label_extractor(batch: BatchData) -> BatchData:
+                    return { 'label': batch['label'] }
+                ds_transforms.append(label_extractor)
+        img_augs: DataSetTransform = partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key'])
+        ds_transforms.append(img_augs)
+        multi_transform: DataSetTransform = partial(K.utils.hf_datasets_multi_transform, transforms=ds_transforms)
+        train_set.set_transform(multi_transform)
         train_set = train_set['train']
     elif dataset_config['type'] == 'custom':
         location = (Path(args.config).parent / dataset_config['location']).resolve()
@@ -267,11 +336,9 @@ def main():
                                num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
 
     if do_train:
-        inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+        opt, train_dl = accelerator.prepare(opt, train_dl)
         if use_wandb:
             wandb.watch(inner_model)
-    else:
-        inner_model_ema, train_dl = accelerator.prepare(inner_model_ema, train_dl)
 
     if accelerator.num_processes == 1:
         args.gns = False
@@ -300,14 +367,32 @@ def main():
             model_ema.requires_grad_(False).eval()
         class_cond_key = 'y'
 
-    state_path = Path(f'{args.name}_state.json')
+    if args.output_to_subdir:
+        run_root = f'{args.out_root}/{args.name}'
+        state_root = metrics_root = run_root
+        demo_root = f'{run_root}/demo'
+        ckpt_root = f'{run_root}/ckpt'
+        demo_file_qualifier = ''
+    else:
+        run_root = demo_root = ckpt_root = state_root = metrics_root = args.out_root
+        demo_file_qualifier = 'demo_'
+    run_qualifier = f'{args.name}_'
+
+    if accelerator.is_main_process:
+        makedirs(run_root, exist_ok=True)
+        makedirs(state_root, exist_ok=True)
+        makedirs(metrics_root, exist_ok=True)
+        makedirs(demo_root, exist_ok=True)
+        makedirs(ckpt_root, exist_ok=True)
+
+    state_path = Path(f'{state_root}/{run_qualifier}state.json')
 
     if state_path.exists() or args.resume:
         if args.resume:
             ckpt_path = args.resume
         if not args.resume:
             state = json.load(open(state_path))
-            ckpt_path = state['latest_checkpoint']
+            ckpt_path = f"{state_root}/{state['latest_checkpoint']}"
         if accelerator.is_main_process:
             print(f'Resuming from {ckpt_path}...')
         ckpt = torch.load(ckpt_path, map_location='cpu')
@@ -369,7 +454,7 @@ def main():
             print('Computing features for reals...')
         reals_features = K.evaluation.compute_features(accelerator, lambda x: next(train_iter)[image_key][1], extractor, args.evaluate_n, args.batch_size)
         if accelerator.is_main_process and not args.evaluate_only:
-            metrics_log = K.utils.CSVLogger(f'{args.name}_metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
+            metrics_log = K.utils.CSVLogger(f'{metrics_root}/{run_qualifier}metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
         del train_iter
 
     cfg_scale = 1.
@@ -389,16 +474,31 @@ def main():
 
     @torch.inference_mode() # note: inference_mode is lower-overhead than no_grad but disables forward-mode AD
     @K.utils.eval_mode(model_ema)
-    def demo():
+    def demo(captioner: GridCaptioner):
         if accelerator.is_main_process:
             tqdm.write('Sampling...')
-        filename = f'{args.name}_demo_{step:08}.png'
+        with FSDP.summon_full_params(model_ema):
+            pass
         n_per_proc = math.ceil(args.sample_n / accelerator.num_processes)
         x = torch.randn([accelerator.num_processes, n_per_proc, model_config['input_channels'], size[0], size[1]], generator=demo_gen).to(device)
         dist.broadcast(x, 0)
         x = x[accelerator.process_index] * sigma_max
         model_fn, extra_args = model_ema, {}
-        if num_classes:
+        caption_ix: Optional[LongTensor] = None
+        if uses_crossattn:
+            assert precomputed_conds is not None
+            cfg_args: CrossAttnCFGArgs = get_precomputed_cond_cfg_args(
+                accelerator=accelerator,
+                precomputed_conds=precomputed_conds,
+                uncond_type=dataset_config['demo_uncond'],
+                n_per_proc=n_per_proc,
+                distribute=True,
+                rng=demo_gen,
+            )
+            caption_ix = cfg_args.caption_ix
+            extra_args = {**extra_args, **cfg_args.sampling_extra_args}
+            model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=cfg_args.masked_uncond, cfg_scale=cfg_scale)
+        elif num_classes:
             class_cond = torch.randint(0, num_classes, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(class_cond, 0)
             # print ImageNet class labels like so:
@@ -407,11 +507,29 @@ def main():
             extra_args[class_cond_key] = class_cond[accelerator.process_index]
             model_fn = make_cfg_model_fn(model_ema)
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
-        x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
+        x_0: FloatTensor = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
         x_0 = accelerator.gather(x_0)[:args.sample_n]
         if accelerator.is_main_process:
-            grid = utils.make_grid(x_0, nrow=math.ceil(args.sample_n ** 0.5), padding=0)
-            K.utils.to_pil_image(grid).save(filename)
+            if uses_crossattn:
+                assert caption_ix is not None
+                pils: List[Image.Image] = to_pil_images(x_0)
+                captions: List[str] = [precomputed_conds.class_captions[caption_ix_.item()] for caption_ix_ in caption_ix.flatten().cpu()]
+                title = f'[step {step}] {args.name} {args.config}'
+                if args.demo_title_qualifier:
+                    title += f' {args.demo_title_qualifier}'
+                grid_pil: Image.Image = captioner.__call__(
+                    imgs=pils,
+                    captions=captions,
+                    title=title,
+                )
+            else:
+                grid = utils.make_grid(x_0, nrow=math.ceil(args.sample_n ** 0.5), padding=0)
+                grid_pil: Image.Image = K.utils.to_pil_image(grid)
+            save_kwargs = { 'subsampling': 0, 'quality': 95 } if args.demo_img_compress else {}
+            fext = 'jpg' if args.demo_img_compress else 'png'
+            filename = f'{demo_root}/{run_qualifier}{demo_file_qualifier}{step:08}.{fext}'
+            grid_pil.save(filename, **save_kwargs)
+
             if use_wandb:
                 wandb.log({'demo_grid': wandb.Image(filename)}, step=step)
 
@@ -422,11 +540,25 @@ def main():
             return
         if accelerator.is_main_process:
             tqdm.write('Evaluating...')
+        with FSDP.summon_full_params(model_ema):
+            pass
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
         def sample_fn(n):
             x = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
             model_fn, extra_args = model_ema, {}
-            if num_classes:
+            if uses_crossattn:
+                assert precomputed_conds is not None
+                cfg_args: CrossAttnCFGArgs = get_precomputed_cond_cfg_args(
+                    accelerator=accelerator,
+                    precomputed_conds=precomputed_conds,
+                    uncond_type=dataset_config['eval_uncond'],
+                    n_per_proc=n,
+                    distribute=False,
+                    rng=None,
+                )
+                extra_args = {**extra_args, **cfg_args.sampling_extra_args}
+                model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=cfg_args.masked_uncond, cfg_scale=cfg_scale)
+            elif num_classes:
                 extra_args[class_cond_key] = torch.randint(0, num_classes, [n], device=device)
                 model_fn = make_cfg_model_fn(model_ema)
             x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=True)
@@ -443,36 +575,49 @@ def main():
 
     def save():
         accelerator.wait_for_everyone()
-        filename = f'{args.name}_{step:08}.pth'
+        filename = f'{ckpt_root}/{run_qualifier}{step:08}.pth'
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
-        inner_model = unwrap(model.inner_model)
-        inner_model_ema = unwrap(model_ema.inner_model)
-        obj = {
-            'config': config,
-            'model': inner_model.state_dict(),
-            'model_ema': inner_model_ema.state_dict(),
-            'opt': opt.state_dict(),
-            'sched': sched.state_dict(),
-            'ema_sched': ema_sched.state_dict(),
-            'epoch': epoch,
-            'step': step,
-            'gns_stats': gns_stats.state_dict() if gns_stats is not None else None,
-            'ema_stats': ema_stats,
-            'demo_gen': demo_gen.get_state(),
-            'elapsed': elapsed,
-        }
-        accelerator.save(obj, filename)
-        if accelerator.is_main_process:
-            state_obj = {'latest_checkpoint': filename}
-            json.dump(state_obj, open(state_path, 'w'))
-        if args.wandb_save_model and use_wandb:
-            wandb.save(filename)
+        with (
+            FSDP.summon_full_params(model.inner_model, rank0_only=True, offload_to_cpu=True, writeback=False),
+            FSDP.summon_full_params(model_ema.inner_model, rank0_only=True, offload_to_cpu=True, writeback=False),
+        ):
+            inner_model = unwrap(model.inner_model)
+            inner_model_ema = unwrap(model_ema.inner_model)
+            obj = {
+                'config': config,
+                'model': inner_model.state_dict(),
+                'model_ema': inner_model_ema.state_dict(),
+                'opt': opt.state_dict(),
+                'sched': sched.state_dict(),
+                'ema_sched': ema_sched.state_dict(),
+                'epoch': epoch,
+                'step': step,
+                'gns_stats': gns_stats.state_dict() if gns_stats is not None else None,
+                'ema_stats': ema_stats,
+                'demo_gen': demo_gen.get_state(),
+                'elapsed': elapsed,
+            }
+            accelerator.save(obj, filename)
+            if accelerator.is_main_process:
+                state_obj = {'latest_checkpoint': relpath(filename, state_root)}
+                json.dump(state_obj, open(state_path, 'w'))
+            if args.wandb_save_model and use_wandb:
+                wandb.save(filename)
+
+    # TODO: are h and w the right way around?
+    samp_h, samp_w = model_config['input_size']
+    sample_size = Dimensions(height=samp_h, width=samp_w)
+    captioner: GridCaptioner = make_default_grid_captioner(
+        font_path=args.font,
+        sample_n=args.sample_n,
+        sample_size=sample_size,
+    )
     
     if args.inference_only:
         if args.sample_n < 1:
             raise ValueError('--inference-only requested but --sample-n is less than 1')
-        demo()
+        demo(captioner)
         if accelerator.is_main_process:
             tqdm.write('Finished inferencing!')
         return
@@ -501,7 +646,16 @@ def main():
                 with accelerator.accumulate(model):
                     reals, _, aug_cond = batch[image_key]
                     class_cond, extra_args = None, {}
-                    if num_classes:
+                    if precomputed_conds is not None:
+                        xattn_extra_args: CrossAttnExtraArgs = get_precomputed_conds_by_ix(
+                            device=accelerator.device,
+                            precomputed_conds=precomputed_conds,
+                            embed_ix=batch['embed_ix'],
+                            cond_dropout_rate=cond_dropout_rate,
+                            allzeros_uncond_rate=dataset_config['allzeros_uncond_rate'],
+                        )
+                        extra_args = {**extra_args, **xattn_extra_args}
+                    elif num_classes:
                         class_cond = batch[class_key]
                         drop = torch.rand(class_cond.shape, device=class_cond.device)
                         class_cond.masked_fill_(drop < cond_dropout_rate, num_classes)
@@ -560,7 +714,7 @@ def main():
                 step += 1
 
                 if step % args.demo_every == 0:
-                    demo()
+                    demo(captioner)
 
                 if evaluate_enabled and step > 0 and step % args.evaluate_every == 0:
                     evaluate()
