@@ -67,6 +67,8 @@ def main():
                    help='measure the gradient noise scale (DDP only, disables stratified sampling)')
     p.add_argument('--grad-accum-steps', type=int, default=1,
                    help='the number of gradient accumulation steps')
+    p.add_argument('--inference-only', action='store_true',
+                   help='run demo sample instead of training')
     p.add_argument('--lr', type=float,
                    help='the learning rate')
     p.add_argument('--mixed-precision', type=str,
@@ -107,7 +109,9 @@ def main():
     except AttributeError:
         pass
 
-    do_train = not args.evaluate_only
+    do_train: bool = not args.evaluate_only and not args.inference_only
+    if args.inference_only and args.evaluate_only:
+        raise ValueError('Cannot fulfil both --inference-only and --evaluate-only; they are mutually-exclusive')
 
     config = K.config.load_config(args.config)
     model_config = config['model']
@@ -349,7 +353,7 @@ def main():
                 load_diffusion_model(args.resume_inference, unwrap(model.inner_model))
             load_diffusion_model(args.resume_inference, unwrap(model_ema.inner_model))
 
-    evaluate_enabled = args.evaluate_every > 0 and args.evaluate_n > 0 or args.evaluate_only
+    evaluate_enabled = do_train and args.evaluate_every > 0 and args.evaluate_n > 0 or args.evaluate_only
     metrics_log = None
     if evaluate_enabled:
         if args.evaluate_with == 'inception':
@@ -397,6 +401,9 @@ def main():
         if num_classes:
             class_cond = torch.randint(0, num_classes, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(class_cond, 0)
+            # print ImageNet class labels like so:
+            # from kdiff_trainer.dataset_meta.imagenet_1k import class_labels
+            # print('\n'.join([' | '.join([class_labels[cell] for cell in row]) for row in class_cond[accelerator.process_index].unflatten(-1, sizes=(4,4)).tolist()]))
             extra_args[class_cond_key] = class_cond[accelerator.process_index]
             model_fn = make_cfg_model_fn(model_ema)
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
@@ -461,10 +468,18 @@ def main():
             json.dump(state_obj, open(state_path, 'w'))
         if args.wandb_save_model and use_wandb:
             wandb.save(filename)
+    
+    if args.inference_only:
+        if args.sample_n < 1:
+            raise ValueError('--inference-only requested but --sample-n is less than 1')
+        demo()
+        if accelerator.is_main_process:
+            tqdm.write('Finished inferencing!')
+        return
 
     if args.evaluate_only:
         if args.evaluate_n < 1:
-            raise ValueError('--evaluate-only requested but evaluate_n is less than 1')
+            raise ValueError('--evaluate-only requested but --evaluate-n is less than 1')
         evaluate()
         if accelerator.is_main_process:
             tqdm.write('Finished evaluating!')
