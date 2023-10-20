@@ -28,7 +28,10 @@ from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
 from typing import List, Optional
 from PIL import Image
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, TypedDict, Generator
+from contextlib import nullcontext
+from itertools import islice
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
@@ -43,6 +46,18 @@ from kdiff_trainer.xattn.crossattn_cfg_args import CrossAttnCFGArgs
 from kdiff_trainer.xattn.crossattn_extra_args import CrossAttnExtraArgs
 from kdiff_trainer.to_pil_images import to_pil_images
 
+SinkOutput = TypedDict('SinkOutput', {
+  '__key__': str,
+  'img.png': Image.Image,
+})
+
+@dataclass
+class Samples:
+    x_0: FloatTensor
+
+@dataclass
+class ClassConditionalSamples(Samples):
+    caption_ix: LongTensor
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -89,6 +104,12 @@ def main():
                    help='the number of gradient accumulation steps')
     p.add_argument('--inference-only', action='store_true',
                    help='run demo sample instead of training')
+    p.add_argument('--inference-n', type=int, default=None,
+                   help='[in inference-only mode] the number of samples to generate in total (in batches of up to --sample-n)')
+    p.add_argument('--inference-out-wds-root', type=str, default=None,
+                   help='[in inference-only mode] directory into which to output WDS .tar files')
+    p.add_argument('--inference-out-wds-shard', type=int, default=0,
+                   help="[in inference-only mode] the directory within the WDS dataset .tar to place each sample. this enables you to prevent key clashes if you were to tell multiple nodes to independently produce .tars and collect them together into a single dataset afterward (poor man's version of multi-node support).")
     p.add_argument('--lr', type=float,
                    help='the learning rate')
     p.add_argument('--mixed-precision', type=str,
@@ -471,14 +492,8 @@ def main():
         if cfg_scale != 1:
             return cfg_model_fn
         return model
-
-    @torch.inference_mode() # note: inference_mode is lower-overhead than no_grad but disables forward-mode AD
-    @K.utils.eval_mode(model_ema)
-    def demo(captioner: GridCaptioner):
-        if accelerator.is_main_process:
-            tqdm.write('Sampling...')
-        with FSDP.summon_full_params(model_ema):
-            pass
+    
+    def generate_batch_of_samples() -> Samples:
         n_per_proc = math.ceil(args.sample_n / accelerator.num_processes)
         x = torch.randn([accelerator.num_processes, n_per_proc, model_config['input_channels'], size[0], size[1]], generator=demo_gen).to(device)
         dist.broadcast(x, 0)
@@ -509,11 +524,40 @@ def main():
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
         x_0: FloatTensor = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
         x_0 = accelerator.gather(x_0)[:args.sample_n]
+        if caption_ix is None:
+            return Samples(x_0)
+        return ClassConditionalSamples(x_0, caption_ix)
+    
+    @torch.inference_mode() # note: inference_mode is lower-overhead than no_grad but disables forward-mode AD
+    @K.utils.eval_mode(model_ema)
+    def generate_pils() -> Generator[Optional[Image.Image], None, None]:
+        if accelerator.is_main_process:
+            tqdm.write('Sampling...')
+        with FSDP.summon_full_params(model_ema):
+            pass
+
+        while True:
+            batch: Samples = generate_batch_of_samples()
+            if accelerator.is_main_process:
+                pils: List[Image.Image] = to_pil_images(batch.x_0)
+                yield from pils
+            else:
+                yield from [None]*batch.x_0.shape[0]
+
+    @torch.inference_mode() # note: inference_mode is lower-overhead than no_grad but disables forward-mode AD
+    @K.utils.eval_mode(model_ema)
+    def demo(captioner: GridCaptioner):
+        if accelerator.is_main_process:
+            tqdm.write('Sampling...')
+        with FSDP.summon_full_params(model_ema):
+            pass
+
+        batch: Samples = generate_batch_of_samples()
         if accelerator.is_main_process:
             if uses_crossattn:
-                assert caption_ix is not None
-                pils: List[Image.Image] = to_pil_images(x_0)
-                captions: List[str] = [precomputed_conds.class_captions[caption_ix_.item()] for caption_ix_ in caption_ix.flatten().cpu()]
+                assert isinstance(batch, ClassConditionalSamples)
+                pils: List[Image.Image] = to_pil_images(batch.x_0)
+                captions: List[str] = [precomputed_conds.class_captions[caption_ix_.item()] for caption_ix_ in batch.caption_ix.flatten().cpu()]
                 title = f'[step {step}] {args.name} {args.config}'
                 if args.demo_title_qualifier:
                     title += f' {args.demo_title_qualifier}'
@@ -523,7 +567,7 @@ def main():
                     title=title,
                 )
             else:
-                grid = utils.make_grid(x_0, nrow=math.ceil(args.sample_n ** 0.5), padding=0)
+                grid = utils.make_grid(batch.x_0, nrow=math.ceil(args.sample_n ** 0.5), padding=0)
                 grid_pil: Image.Image = K.utils.to_pil_image(grid)
             save_kwargs = { 'subsampling': 0, 'quality': 95 } if args.demo_img_compress else {}
             fext = 'jpg' if args.demo_img_compress else 'png'
@@ -617,7 +661,25 @@ def main():
     if args.inference_only:
         if args.sample_n < 1:
             raise ValueError('--inference-only requested but --sample-n is less than 1')
-        demo(captioner)
+        if (args.inference_n is None) != (args.inference_out_wds_root is None):
+            raise ValueError('--inference-n and --inference-out-wds-root must both be provided if either are provided.')
+        if args.inference_n is None:
+            demo(captioner)
+        else:
+            pils = islice(generate_pils(), args.inference_n)
+            if accelerator.is_main_process:
+                from webdataset import ShardWriter
+                sink_ctx = ShardWriter(f'{args.inference_out_wds_root}/%05d.tar', maxcount=10000)
+            else:
+                sink_ctx = nullcontext()
+            with sink_ctx as sink:
+                for ix, pil in enumerate(pils):
+                    if accelerator.is_main_process:
+                        out: SinkOutput = {
+                            '__key__': f'{args.inference_out_wds_shard}/{ix}',
+                            'img.png': pil,
+                        }
+                        sink.write(out)
         if accelerator.is_main_process:
             tqdm.write('Finished inferencing!')
         return
