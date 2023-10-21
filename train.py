@@ -29,9 +29,10 @@ from tqdm.auto import tqdm
 from typing import List, Optional
 from PIL import Image
 from dataclasses import dataclass
-from typing import Optional, TypedDict, Generator
+from typing import Optional, TypedDict, Generator, Callable
 from contextlib import nullcontext
 from itertools import islice
+from tqdm import tqdm
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
@@ -45,6 +46,8 @@ from kdiff_trainer.xattn.get_precomputed_conds_by_ix import get_precomputed_cond
 from kdiff_trainer.xattn.crossattn_cfg_args import CrossAttnCFGArgs
 from kdiff_trainer.xattn.crossattn_extra_args import CrossAttnExtraArgs
 from kdiff_trainer.to_pil_images import to_pil_images
+from kdiff_trainer.tqdm_ctx import tqdm_environ, TqdmOverrides
+from kdiff_trainer.iteration.batched import batched
 
 SinkOutput = TypedDict('SinkOutput', {
   '__key__': str,
@@ -537,7 +540,8 @@ def main():
             pass
 
         while True:
-            batch: Samples = generate_batch_of_samples()
+            with tqdm_environ(TqdmOverrides(position=1)):
+                batch: Samples = generate_batch_of_samples()
             if accelerator.is_main_process:
                 pils: List[Image.Image] = to_pil_images(batch.x_0)
                 yield from pils
@@ -662,6 +666,8 @@ def main():
         if args.sample_n < 1:
             raise ValueError('--inference-only requested but --sample-n is less than 1')
         if (args.inference_n is None) != (args.inference_out_wds_root is None):
+            # this mutual-presence requirement could be relaxed if we were to implement other ways of outputting many images (e.g. folder-of-images)
+            # but the only current use-case for "inference more samples than we can fit in a batch" is for _making datasets_, which may as well be WDS.
             raise ValueError('--inference-n and --inference-out-wds-root must both be provided if either are provided.')
         if args.inference_n is None:
             demo(captioner)
@@ -669,17 +675,29 @@ def main():
             pils = islice(generate_pils(), args.inference_n)
             if accelerator.is_main_process:
                 from webdataset import ShardWriter
+                makedirs(args.inference_out_wds_root, exist_ok=True)
                 sink_ctx = ShardWriter(f'{args.inference_out_wds_root}/%05d.tar', maxcount=10000)
+                def sink_pil(sink: ShardWriter, ix: int, pil: Image.Image) -> None:
+                    out: SinkOutput = {
+                        '__key__': f'{args.inference_out_wds_shard}/{ix}',
+                        'img.png': pil,
+                    }
+                    sink.write(out)
             else:
                 sink_ctx = nullcontext()
+                sink_pil: Callable[[Optional[ShardWriter], int, Image.Image], None] = lambda *_: ...
             with sink_ctx as sink:
-                for ix, pil in enumerate(pils):
-                    if accelerator.is_main_process:
-                        out: SinkOutput = {
-                            '__key__': f'{args.inference_out_wds_shard}/{ix}',
-                            'img.png': pil,
-                        }
-                        sink.write(out)
+                for batch_ix, pils in enumerate(tqdm(
+                    # collating into batches just to get a more reliable progress report from tqdm
+                    batched(pils, args.sample_n),
+                    'sampling batches',
+                    disable=not accelerator.is_main_process,
+                    position=0,
+                    total=math.ceil(args.inference_n/args.sample_n),
+                    unit='batch',
+                )):
+                    for ix, pil in enumerate(pils):
+                        sink_pil(sink, args.sample_n*batch_ix + ix, pil)
         if accelerator.is_main_process:
             tqdm.write('Finished inferencing!')
         return
