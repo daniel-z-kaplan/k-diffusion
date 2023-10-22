@@ -138,11 +138,11 @@ def main():
     )
 
     if accelerator.is_main_process:
-        try:
-            for set_name, train_set in zip(('pred', 'target'), (pred_train_set, target_train_set)):
+        for set_name, train_set in zip(('pred', 'target'), (pred_train_set, target_train_set)):
+            try:
                 print(f'Number of items in {set_name} dataset: {len(train_set):,}')
-        except TypeError:
-            pass
+            except TypeError:
+                pass
 
     pred_train_dl, target_train_dl = (data.DataLoader(train_set, args.batch_size, shuffle=not isinstance(train_set, data.IterableDataset), drop_last=True, num_workers=args.num_workers, persistent_workers=True, pin_memory=True) for train_set in (pred_train_set, target_train_set))
     pred_train_dl, target_train_dl = accelerator.prepare(pred_train_dl, target_train_dl)
