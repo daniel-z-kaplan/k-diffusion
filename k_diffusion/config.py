@@ -211,7 +211,9 @@ def make_model(config):
                 self_attn = models.image_transformer_v2.NoAttentionSpec()
             else:
                 raise ValueError(f'unsupported self attention type {self_attn["type"]}')
-            if cross_attn_layer is not None:
+            if cross_attn_layer is None:
+                cross_attn_spec = None
+            else:
                 cross_attn_spec = models.image_transformer_v2.CrossAttentionSpec(
                     d_head=cross_attn_layer.get('d_head', 64),
                     d_cross=d_cross,
