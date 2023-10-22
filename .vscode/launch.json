@@ -213,6 +213,20 @@
         "--sample-n", "4",
         "--start-method", "fork"
       ],
+    },
+    {
+      "name": "Python: Evaluate OpenAI dataset",
+      "type": "python",
+      "request": "launch",
+      "program": "train.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "--config-pred", "configs/config_guided_diffusion_dataset_pred.json",
+        "--config-target", "configs/config_imagenet_dataset.json",
+        "--evaluate-n", "10",
+        "--start-method", "fork"
+      ],
     }
   ]
 }
