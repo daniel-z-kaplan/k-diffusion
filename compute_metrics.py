@@ -8,9 +8,11 @@ from torch import distributed as dist, multiprocessing as mp, Tensor
 from torch.utils import data
 from torchvision import datasets, transforms
 from functools import partial
-from typing import Dict, Optional, Literal, Tuple
+from typing import Dict, Optional, Literal, Tuple, List
 from PIL import Image
 from io import BytesIO
+import math
+from tqdm import trange
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -76,6 +78,8 @@ def main():
                    help='configuration file detailing a dataset of predictions from a model')
     p.add_argument('--config-target', type=str, required=True,
                    help='configuration file detailing a dataset of ground-truth examples')
+    p.add_argument('--torchmetrics-fid', action='store_true',
+                   help='whether to use torchmetrics FID (as opposed to CleanFID)')
     p.add_argument('--evaluate-n', type=int, default=2000,
                    help='the number of samples to draw to evaluate')
     p.add_argument('--evaluate-with', type=str, default='inception',
@@ -158,22 +162,44 @@ def main():
             raise ValueError(f"Invalid evaluation feature extractor '{args.evaluate_with}'")
     
     pred_train_iter, target_train_iter = (iter(dl) for dl in (pred_train_dl, target_train_dl))
-    if accelerator.is_main_process:
-        features: Dict[Literal['pred', 'target'], Optional[Tensor]] = { 'pred': None, 'target': None }
-        for source_name, iter_ in zip(('pred', 'target'), (pred_train_iter, target_train_iter)):
-            print(f'Computing features for {source_name}...')
-            # to anybody who wants to shorten this to a lambda: have you tried putting a breakpoint in a lambda?
-            def sample_fn(_) -> Tensor:
-                samp = next(iter_)
-                return samp[0]
-            features[source_name] = K.evaluation.compute_features(accelerator, sample_fn, extractor, args.evaluate_n, args.batch_size)
+    if args.torchmetrics_fid:
         if accelerator.is_main_process:
-            fid = K.evaluation.fid(features['pred'], features['target'])
-            kid = K.evaluation.kid(features['pred'], features['target'])
-            print(f'FID: {fid.item():g}, KID: {kid.item():g}')
-        del iter_
-
-
+            from torchmetrics.image.fid import FrechetInceptionDistance
+            # "normalize" means "my images are [0, 1] floats"
+            # https://torchmetrics.readthedocs.io/en/stable/image/frechet_inception_distance.html
+            fid_obj = FrechetInceptionDistance(feature=2048, normalize=True)
+            fid_obj.to(accelerator.device)
+    features: Dict[Literal['pred', 'target'], Optional[Tensor]] = { 'pred': None, 'target': None }
+    for source_name, iter_ in zip(('pred', 'target'), (pred_train_iter, target_train_iter)):
+        print(f'Computing features for {source_name}...')
+        # to anybody who wants to shorten this to a lambda: have you tried putting a breakpoint in a lambda?
+        def sample_fn(_) -> Tensor:
+            samp = next(iter_)
+            return samp[0]
+        if args.torchmetrics_fid:
+            n_per_proc = math.ceil(args.evaluate_n / accelerator.num_processes)
+            feats_all: List[Tensor] = []
+            try:
+                for i in trange(0, n_per_proc, args.batch_size, disable=not accelerator.is_main_process):
+                    cur_batch_size: int = min(args.evaluate_n - i, args.batch_size)
+                    samples: Tensor = sample_fn(cur_batch_size)[:cur_batch_size]
+                    accelerator.gather(samples)
+                    feats_all.append(accelerator.gather(extractor(samples)))
+                    if accelerator.is_main_process:
+                        fid_obj.update(samples, real=source_name == 'target')
+            except StopIteration:
+                pass
+            features[source_name] = torch.cat(feats_all)[:args.evaluate_n]
+        else:
+            features[source_name] = K.evaluation.compute_features(accelerator, sample_fn, extractor, args.evaluate_n, args.batch_size)
+    if accelerator.is_main_process:
+        if args.torchmetrics_fid:
+            fid = fid_obj.compute()
+            print(f'torchmetrics FID: {fid.item():g}')
+        fid = K.evaluation.fid(features['pred'], features['target'])
+        kid = K.evaluation.kid(features['pred'], features['target'])
+        print(f'CleanFID FID: {fid.item():g}, KID: {kid.item():g}')
+    del iter_
 
 if __name__ == '__main__':
     main()

@@ -224,8 +224,11 @@
       "args": [
         "--config-pred", "configs/config_guided_diffusion_dataset_pred.json",
         "--config-target", "configs/config_imagenet_dataset.json",
-        "--evaluate-n", "10",
-        "--start-method", "fork"
+        "--evaluate-n", "50000",
+        "--batch-size", "256",
+        // "--num-workers", "1",
+        "--start-method", "fork",
+        "--torchmetrics-fid",
       ],
     }
   ]

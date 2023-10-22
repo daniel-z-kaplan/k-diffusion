@@ -2,3 +2,4 @@ datasets
 transformers
 json5
 webdataset
+torchmetrics[image]
