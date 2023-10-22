@@ -1,4 +1,5 @@
 {
+  "model": { "type": "none" },
   "dataset": {
     "type": "imagefolder-class",
     "location": "/nvme1/ml-data/ImageNet/train",

@@ -218,7 +218,7 @@
       "name": "Python: Evaluate OpenAI dataset",
       "type": "python",
       "request": "launch",
-      "program": "train.py",
+      "program": "compute_metrics.py",
       "console": "integratedTerminal",
       "justMyCode": false,
       "args": [
