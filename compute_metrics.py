@@ -125,9 +125,9 @@ def main():
     target_dataset_config = config_target['dataset']
 
     tf = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize(size[0], interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.Resize(size[0], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
         transforms.CenterCrop(size[0]),
+        transforms.ToTensor(),
     ])
 
     pred_train_set, target_train_set = (
