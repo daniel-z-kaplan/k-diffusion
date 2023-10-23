@@ -20,19 +20,20 @@ import torch._dynamo
 from torch import distributed as dist
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim, FloatTensor, LongTensor
+from torch import optim, FloatTensor, LongTensor, Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils import data
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
-from typing import List, Optional
+from typing import List, Optional, Dict
 from PIL import Image
 from dataclasses import dataclass
-from typing import Optional, TypedDict, Generator, Callable
+from typing import Optional, TypedDict, Generator, Callable, Tuple
 from contextlib import nullcontext
 from itertools import islice
 from tqdm import tqdm
+from io import BytesIO
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
@@ -334,6 +335,30 @@ def main():
         multi_transform: DataSetTransform = partial(K.utils.hf_datasets_multi_transform, transforms=ds_transforms)
         train_set.set_transform(multi_transform)
         train_set = train_set['train']
+    elif dataset_config['type'] == 'wds' or dataset_config['type'] == 'wds-class':
+        from webdataset import WebDataset
+        def img_from_sample(sample: Dict) -> Tensor:
+            img_bytes: bytes = sample[dataset_config['image_key']]
+            with BytesIO(img_bytes) as stream:
+                img: Image.Image = Image.open(stream)
+                img.load()
+            transformed_tensor: Tensor = tf(img)
+            return transformed_tensor
+        def map_labeled_wds_sample(sample: Dict) -> Tuple[Image.Image, int]:
+            img: Tensor = img_from_sample(sample)
+            label: int = sample[dataset_config['label_key']]
+            return (img, label)
+        def map_wds_sample(sample: Dict) -> Tuple[Image.Image]:
+            img: Tensor = img_from_sample(sample)
+            return (img,)
+        match dataset_config['type']:
+            case 'wds':
+                mapper = map_wds_sample
+            case 'wds-class':
+                mapper = map_labeled_wds_sample
+            case _:
+                raise ValueError('')
+        train_set = WebDataset(dataset_config['location']).map(mapper).shuffle(1000)
     elif dataset_config['type'] == 'custom':
         location = (Path(args.config).parent / dataset_config['location']).resolve()
         spec = importlib.util.spec_from_file_location('custom_dataset', location)
