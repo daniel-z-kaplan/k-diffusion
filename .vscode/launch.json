@@ -175,7 +175,8 @@
       "justMyCode": true,
       "args": [
         "--config", "configs/config_guided_diffusion_imagenet.json",
-        "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
+        // "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
+        "--resume-inference", "/p/scratch/ccstdl/birch1/256x256_diffusion.pt",
         "--evaluate-only",
         "--evaluate-n", "4",
         "--start-method", "fork"
@@ -190,7 +191,8 @@
       "justMyCode": true,
       "args": [
         "--config", "configs/config_guided_diffusion_imagenet.json",
-        "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
+        // "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
+        "--resume-inference", "/p/scratch/ccstdl/birch1/256x256_diffusion.pt",
         "--inference-only",
         "--sample-n", "16",
         "--start-method", "fork"
@@ -205,7 +207,8 @@
       "justMyCode": false,
       "args": [
         "--config", "configs/config_guided_diffusion_imagenet.json",
-        "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
+        // "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
+        "--resume-inference", "/p/scratch/ccstdl/birch1/256x256_diffusion.pt",
         "--inference-only",
         "--inference-n", "10",
         "--inference-out-wds-root", "out/wds",
