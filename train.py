@@ -29,11 +29,12 @@ from tqdm.auto import tqdm
 from typing import List, Optional, Dict
 from PIL import Image
 from dataclasses import dataclass
-from typing import Optional, TypedDict, Generator, Callable, Tuple
+from typing import Optional, TypedDict, Generator, Callable, Tuple, Union
 from contextlib import nullcontext
 from itertools import islice
 from tqdm import tqdm
 from io import BytesIO
+import numpy as np
 
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
@@ -61,7 +62,15 @@ class Samples:
 
 @dataclass
 class ClassConditionalSamples(Samples):
-    caption_ix: LongTensor
+    class_cond: LongTensor
+
+@dataclass
+class Sample:
+    pil: Image.Image
+
+@dataclass
+class ClassConditionalSample(Sample):
+    class_cond: int
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -344,10 +353,10 @@ def main():
                 img.load()
             transformed_tensor: Tensor = tf(img)
             return transformed_tensor
-        def map_labeled_wds_sample(sample: Dict) -> Tuple[Image.Image, int]:
+        def map_class_cond_wds_sample(sample: Dict) -> Tuple[Image.Image, int]:
             img: Tensor = img_from_sample(sample)
-            label: int = sample[dataset_config['label_key']]
-            return (img, label)
+            class_cond: int = sample[dataset_config['class_cond_key']]
+            return (img, class_cond)
         def map_wds_sample(sample: Dict) -> Tuple[Image.Image]:
             img: Tensor = img_from_sample(sample)
             return (img,)
@@ -355,7 +364,7 @@ def main():
             case 'wds':
                 mapper = map_wds_sample
             case 'wds-class':
-                mapper = map_labeled_wds_sample
+                mapper = map_class_cond_wds_sample
             case _:
                 raise ValueError('')
         train_set = WebDataset(dataset_config['location']).map(mapper).shuffle(1000)
@@ -527,7 +536,7 @@ def main():
         dist.broadcast(x, 0)
         x = x[accelerator.process_index] * sigma_max
         model_fn, extra_args = model_ema, {}
-        caption_ix: Optional[LongTensor] = None
+        class_cond: Optional[LongTensor] = None
         if uses_crossattn:
             assert precomputed_conds is not None
             cfg_args: CrossAttnCFGArgs = get_precomputed_cond_cfg_args(
@@ -538,7 +547,7 @@ def main():
                 distribute=True,
                 rng=demo_gen,
             )
-            caption_ix = cfg_args.caption_ix
+            class_cond = cfg_args.caption_ix
             extra_args = {**extra_args, **cfg_args.sampling_extra_args}
             model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=cfg_args.masked_uncond, cfg_scale=cfg_scale)
         elif num_classes:
@@ -552,13 +561,13 @@ def main():
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
         x_0: FloatTensor = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
         x_0 = accelerator.gather(x_0)[:args.sample_n]
-        if caption_ix is None:
+        if class_cond is None:
             return Samples(x_0)
-        return ClassConditionalSamples(x_0, caption_ix)
+        return ClassConditionalSamples(x_0, class_cond.flatten(end_dim=1)[:args.sample_n])
     
     @torch.inference_mode() # note: inference_mode is lower-overhead than no_grad but disables forward-mode AD
     @K.utils.eval_mode(model_ema)
-    def generate_pils() -> Generator[Optional[Image.Image], None, None]:
+    def generate_samples() -> Generator[Optional[Sample], None, None]:
         if accelerator.is_main_process:
             tqdm.write('Sampling...')
         with FSDP.summon_full_params(model_ema):
@@ -569,7 +578,12 @@ def main():
                 batch: Samples = generate_batch_of_samples()
             if accelerator.is_main_process:
                 pils: List[Image.Image] = to_pil_images(batch.x_0)
-                yield from pils
+                if isinstance(batch, ClassConditionalSamples):
+                    for pil, class_cond in zip(pils, batch.class_cond.unbind()):
+                        yield ClassConditionalSample(pil, class_cond.item())
+                else:
+                    for pil in pils:
+                        yield Sample(pil)
             else:
                 yield from [None]*batch.x_0.shape[0]
 
@@ -586,7 +600,7 @@ def main():
             if uses_crossattn:
                 assert isinstance(batch, ClassConditionalSamples)
                 pils: List[Image.Image] = to_pil_images(batch.x_0)
-                captions: List[str] = [precomputed_conds.class_captions[caption_ix_.item()] for caption_ix_ in batch.caption_ix.flatten().cpu()]
+                captions: List[str] = [precomputed_conds.class_captions[caption_ix_.item()] for caption_ix_ in batch.class_cond.flatten().cpu()]
                 title = f'[step {step}] {args.name} {args.config}'
                 if args.demo_title_qualifier:
                     title += f' {args.demo_title_qualifier}'
@@ -697,32 +711,41 @@ def main():
         if args.inference_n is None:
             demo(captioner)
         else:
-            pils = islice(generate_pils(), args.inference_n)
+            samples = islice(generate_samples(), args.inference_n)
             if accelerator.is_main_process:
                 from webdataset import ShardWriter
                 makedirs(args.inference_out_wds_root, exist_ok=True)
                 sink_ctx = ShardWriter(f'{args.inference_out_wds_root}/%05d.tar', maxcount=10000)
-                def sink_pil(sink: ShardWriter, ix: int, pil: Image.Image) -> None:
-                    out: SinkOutput = {
-                        '__key__': f'{args.inference_out_wds_shard}/{ix}',
-                        'img.png': pil,
-                    }
-                    sink.write(out)
+                if num_classes:
+                    def sink_sample(sink: ShardWriter, ix: int, sample: ClassConditionalSample) -> None:
+                        out: SinkOutput = {
+                            '__key__': f'{args.inference_out_wds_shard}/{ix}',
+                            'img.png': sample.pil,
+                            'class_cond.npy': np.array(sample.class_cond),
+                        }
+                        sink.write(out)
+                else:
+                    def sink_sample(sink: ShardWriter, ix: int, sample: Sample) -> None:
+                        out: SinkOutput = {
+                            '__key__': f'{args.inference_out_wds_shard}/{ix}',
+                            'img.png': sample.pil,
+                        }
+                        sink.write(out)
             else:
                 sink_ctx = nullcontext()
-                sink_pil: Callable[[Optional[ShardWriter], int, Image.Image], None] = lambda *_: ...
+                sink_sample: Callable[[Optional[ShardWriter], int, Sample], None] = lambda *_: ...
             with sink_ctx as sink:
-                for batch_ix, pils in enumerate(tqdm(
+                for batch_ix, samples in enumerate(tqdm(
                     # collating into batches just to get a more reliable progress report from tqdm
-                    batched(pils, args.sample_n),
+                    batched(samples, args.sample_n),
                     'sampling batches',
                     disable=not accelerator.is_main_process,
                     position=0,
                     total=math.ceil(args.inference_n/args.sample_n),
                     unit='batch',
                 )):
-                    for ix, pil in enumerate(pils):
-                        sink_pil(sink, args.sample_n*batch_ix + ix, pil)
+                    for ix, sample in enumerate(samples):
+                        sink_sample(sink, args.sample_n*batch_ix + ix, sample)
         if accelerator.is_main_process:
             tqdm.write('Finished inferencing!')
         return

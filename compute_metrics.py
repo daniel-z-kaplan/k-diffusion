@@ -42,10 +42,10 @@ def get_train_set(dataset_config: Dict, config_path: str, tf: Optional[transform
                     img.load()
                 transformed_tensor: Tensor = tf(img)
                 return transformed_tensor
-            def map_labeled_wds_sample(sample: Dict) -> Tuple[Image.Image, int]:
+            def map_class_cond_wds_sample(sample: Dict) -> Tuple[Image.Image, int]:
                 img: Tensor = img_from_sample(sample)
-                label: int = sample[dataset_config['label_key']]
-                return (img, label)
+                class_cond: int = sample[dataset_config['class_cond_key']]
+                return (img, class_cond)
             def map_wds_sample(sample: Dict) -> Tuple[Image.Image]:
                 img: Tensor = img_from_sample(sample)
                 return (img,)
@@ -53,7 +53,7 @@ def get_train_set(dataset_config: Dict, config_path: str, tf: Optional[transform
                 case 'wds':
                     mapper = map_wds_sample
                 case 'wds-class':
-                    mapper = map_labeled_wds_sample
+                    mapper = map_class_cond_wds_sample
                 case _:
                     raise ValueError('')
             train_set = WebDataset(dataset_config['location']).map(mapper).shuffle(1000)
