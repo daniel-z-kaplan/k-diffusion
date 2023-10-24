@@ -533,14 +533,17 @@ class NeighborhoodTransformerLayer(nn.Module):
 
 
 class ShiftedWindowTransformerLayer(nn.Module):
-    def __init__(self, d_model, d_ff, d_head, cond_features, window_size, index, dropout=0.0):
+    def __init__(self, d_model, d_ff, d_head, cond_features, window_size, index, cross_attn: Optional[CrossAttentionBlock] = None, dropout=0.0):
         super().__init__()
         window_shift = window_size // 2 if index % 2 == 1 else 0
         self.self_attn = ShiftedWindowSelfAttentionBlock(d_model, d_head, cond_features, window_size, window_shift, dropout=dropout)
+        self.cross_attn = cross_attn
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
     def forward(self, x, pos, cond, crossattn_cond: Optional[FloatTensor] = None, crossattn_mask: Optional[BoolTensor] = None):
         x = checkpoint(self.self_attn, x, pos, cond)
+        if self.cross_attn is not None:
+            x = checkpoint(self.cross_attn, x, cond, crossattn_cond, crossattn_mask)
         x = checkpoint(self.ff, x, cond)
         return x
 
@@ -714,7 +717,7 @@ class ImageTransformerDenoiserModelV2(nn.Module):
             elif isinstance(spec.self_attn, NeighborhoodAttentionSpec):
                 layer_factory = lambda _: NeighborhoodTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.kernel_size, cross_attn=cross_attn, dropout=dropout)
             elif isinstance(spec.self_attn, ShiftedWindowAttentionSpec):
-                layer_factory = lambda i: ShiftedWindowTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.window_size, i, dropout=dropout)
+                layer_factory = lambda i: ShiftedWindowTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.window_size, i, cross_attn=cross_attn, dropout=dropout)
             elif isinstance(spec.self_attn, NoAttentionSpec):
                 layer_factory = lambda _: NoAttentionTransformerLayer(spec.width, spec.d_ff, mapping.width, dropout=dropout)
             else:
