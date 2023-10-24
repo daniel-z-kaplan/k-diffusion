@@ -22,6 +22,7 @@
   "dataset": {
     "type": "imagefolder-class",
     "location": "/nvme1/ml-data/ImageNet/train",
-    "num_classes": 1000
+    "num_classes": 1000,
+    "classes_to_captions": "imagenet-1k"
   }
 }

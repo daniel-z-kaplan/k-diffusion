@@ -10,6 +10,7 @@ from .crossattn_cfg_args import CrossAttnCFGArgs
 def get_precomputed_cond_cfg_args(
     accelerator: Accelerator,
     precomputed_conds: PrecomputedConds,
+    uncond_class_ix: int,
     uncond_type: Literal['allzeros', 'emptystr'],
     n_per_proc: int,
     distribute: bool,
@@ -25,8 +26,8 @@ def get_precomputed_cond_cfg_args(
     cond: FloatTensor = precomputed_conds.masked_conds.cond.index_select(0, my_captions)
     cond_mask: BoolTensor = precomputed_conds.masked_conds.mask.index_select(0, my_captions)
     if uncond_type == 'allzeros':
-        cond[my_captions == precomputed_conds.text_uncond_ix] = 0
-        cond_mask[my_captions == precomputed_conds.text_uncond_ix] = 1
+        cond[my_captions == uncond_class_ix] = 0
+        cond_mask[my_captions == uncond_class_ix] = 1
         masked_uncond = precomputed_conds.allzeros_masked_uncond
     elif uncond_type == 'emptystr':
         masked_uncond = precomputed_conds.emptystr_masked_uncond

@@ -29,7 +29,7 @@ from tqdm.auto import tqdm
 from typing import List, Optional, Dict
 from PIL import Image
 from dataclasses import dataclass
-from typing import Optional, TypedDict, Generator, Callable, Tuple, Union
+from typing import Optional, TypedDict, Generator, Callable, Tuple, Literal
 from contextlib import nullcontext
 from itertools import islice
 from tqdm import tqdm
@@ -50,6 +50,7 @@ from kdiff_trainer.xattn.crossattn_extra_args import CrossAttnExtraArgs
 from kdiff_trainer.to_pil_images import to_pil_images
 from kdiff_trainer.tqdm_ctx import tqdm_environ, TqdmOverrides
 from kdiff_trainer.iteration.batched import batched
+from kdiff_trainer.dataset_meta.get_class_captions import get_class_captions, ClassCaptions
 
 SinkOutput = TypedDict('SinkOutput', {
   '__key__': str,
@@ -97,6 +98,8 @@ def main():
                    help='for outputs (checkpoints, demo samples, state, metrics): whether to use {{out_root}}/{{name}}/ subdirectories. When True: saves/loads from/to {{out_root}}/{{name}}/[{{product}}/]*, ({{product}}/ subdirectories are used for demo samples and checkpoints). When False: saves/loads from/to {{out_root}}/{{name}}_*')
     p.add_argument('--demo-every', type=int, default=500,
                    help='save a demo grid every this many steps')
+    p.add_argument('--demo-classcond-include-uncond', action='store_true',
+                   help='when producing demo grids for class-conditional tasks: allow the generation of uncond demo samples (class chosen from num_classes+1 instead of merely num_classes)')
     p.add_argument('--dinov2-model', type=str, default='vitl14',
                    choices=K.evaluation.DINOv2FeatureExtractor.available_models(),
                    help='the DINOv2 model to use to evaluate')
@@ -208,27 +211,18 @@ def main():
     demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
     elapsed = 0.0
 
+    class_captions: Optional[ClassCaptions] = get_class_captions(dataset_config['classes_to_captions']) if 'classes_to_captions' in dataset_config else None
+    
     uses_crossattn: bool = 'cross_attn' in model_config and model_config['cross_attn']
     if uses_crossattn:
         assert 'demo_uncond' in dataset_config
         assert dataset_config['demo_uncond'] == 'allzeros' or dataset_config['demo_uncond'] == 'emptystr'
+        assert class_captions is not None, "cross-attention is currently only implemented for precomputed conditions based on class labels, but your dataset config does not tell us what convention to use to produce captions from your class indices. set your config's dataset.classes_to_captions to a dataset name for which we have a mapping"
 
-    class_captions: Optional[List[str]] = None
-    if 'classes_to_captions' in dataset_config:
-        if dataset_config['classes_to_captions'] == 'oxford-flowers':
-            from kdiff_trainer.dataset_meta.oxford_flowers import flower_classes
-            # TODO: figure out what to do about uncond indexing
-            uncond = ''
-            class_captions: List[str] = [uncond, *flower_classes]
-        elif dataset_config['classes_to_captions'] == 'imagenet-1k':
-            from kdiff_trainer.dataset_meta.imagenet_1k import class_labels
-            class_captions: List[str] = class_labels
-        else:
-            raise ValueError(f"Never heard of classes_to_captions '{dataset_config['classes_to_captions']}'")
-    
     precomputed_conds: Optional[PrecomputedConds] = precompute_conds(
         accelerator=accelerator,
-        classes_to_captions=dataset_config['classes_to_captions'],
+        class_captions=class_captions.embed_class_captions,
+        uncond_class_ix=class_captions.uncond_class_ix,
         encoder=model_config['cross_attn']['encoder'],
         trust_remote_code=args.text_model_trust_remote_code,
         hf_cache_dir=args.text_model_hf_cache_dir,
@@ -336,22 +330,20 @@ def main():
         train_set = load_dataset(dataset_config['location'])
         ds_transforms: List[DataSetTransform] = []
         if uses_crossattn:
-            if 'classes_to_captions' in dataset_config:
-                assert dataset_config['classes_to_captions'] == 'oxford-flowers'
-                from kdiff_trainer.dataset_meta.oxford_flowers import ordinal_to_lexical
-                def embed_ix_extractor(batch: BatchData) -> BatchData:
-                    labels_ordinal: List[int] = batch['label']
-                    # labels_ordinal is 1-indexed.
-                    # the conds in text_embeds happen to be 1-indexed too, because we inserted an uncond embed at index 0
-                    # had we not embedded an uncond at index 0, we would need to adapt labels_ordinal's 1-index to text_embeds' 0-index:
-                    # labels_lexical_zeroix: List[int] = [ordinal_to_lexical[o]-1 for o in labels_ordinal]
-                    labels_lexical: List[int] = [ordinal_to_lexical[o] for o in labels_ordinal]
-                    return { 'embed_ix': labels_lexical }
-                ds_transforms.append(embed_ix_extractor)
-            else:
+            if class_captions is None:
                 def label_extractor(batch: BatchData) -> BatchData:
                     return { 'label': batch['label'] }
                 ds_transforms.append(label_extractor)
+            else:
+                if class_captions.dataset_label_to_canonical_label is None:
+                    def embed_ix_extractor(batch: BatchData) -> BatchData:
+                        return { 'embed_ix': batch['label'] }
+                else:
+                    def embed_ix_extractor(batch: BatchData) -> BatchData:
+                        labels_nominal: List[int] = batch['label']
+                        labels_canonical: List[int] = [class_captions.dataset_label_to_canonical_label(o) for o in labels_nominal]
+                        return { 'embed_ix': labels_canonical }
+                ds_transforms.append(embed_ix_extractor)
         img_augs: DataSetTransform = partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key'])
         ds_transforms.append(img_augs)
         multi_transform: DataSetTransform = partial(K.utils.hf_datasets_multi_transform, transforms=ds_transforms)
@@ -529,6 +521,7 @@ def main():
         del train_iter
 
     cfg_scale = 1.
+    maybe_uncond_class: Literal[1, 0] = 1 if args.demo_classcond_include_uncond else 0
 
     def make_cfg_model_fn(model):
         def cfg_model_fn(x, sigma, class_cond):
@@ -551,10 +544,11 @@ def main():
         model_fn, extra_args = model_ema, {}
         class_cond: Optional[LongTensor] = None
         if uses_crossattn:
-            assert precomputed_conds is not None
+            assert precomputed_conds is not None, "cross-attention is currently only implemented for precomputed conditions"
             cfg_args: CrossAttnCFGArgs = get_precomputed_cond_cfg_args(
                 accelerator=accelerator,
                 precomputed_conds=precomputed_conds,
+                uncond_class_ix=class_captions.uncond_class_ix,
                 uncond_type=dataset_config['demo_uncond'],
                 n_per_proc=n_per_proc,
                 distribute=True,
@@ -564,7 +558,7 @@ def main():
             extra_args = {**extra_args, **cfg_args.sampling_extra_args}
             model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=cfg_args.masked_uncond, cfg_scale=cfg_scale)
         elif num_classes:
-            class_cond = torch.randint(0, num_classes, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
+            class_cond = torch.randint(0, num_classes + maybe_uncond_class, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(class_cond, 0)
             # print ImageNet class labels like so:
             # from kdiff_trainer.dataset_meta.imagenet_1k import class_labels
@@ -613,7 +607,7 @@ def main():
             if class_captions is not None:
                 assert isinstance(batch, ClassConditionalSamples)
                 pils: List[Image.Image] = to_pil_images(batch.x_0)
-                captions: List[str] = [class_captions[caption_ix_.item()] for caption_ix_ in batch.class_cond.flatten().cpu()]
+                captions: List[str] = [class_captions.demo_class_captions[caption_ix_.item()] for caption_ix_ in batch.class_cond.flatten().cpu()]
                 title = f'[step {step}] {args.name} {args.config}'
                 if args.demo_title_qualifier:
                     title += f' {args.demo_title_qualifier}'
@@ -647,10 +641,11 @@ def main():
             x = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
             model_fn, extra_args = model_ema, {}
             if uses_crossattn:
-                assert precomputed_conds is not None
+                assert precomputed_conds is not None, "cross-attention is currently only implemented for precomputed conditions"
                 cfg_args: CrossAttnCFGArgs = get_precomputed_cond_cfg_args(
                     accelerator=accelerator,
                     precomputed_conds=precomputed_conds,
+                    uncond_class_ix=class_captions.uncond_class_ix,
                     uncond_type=dataset_config['eval_uncond'],
                     n_per_proc=n,
                     distribute=False,
@@ -715,6 +710,9 @@ def main():
     )
     
     if args.inference_only:
+        if args.demo_classcond_include_uncond:
+            if accelerator.is_main_process:
+                print('WARN: you have enabled uncond samples to be generated (--demo-classcond-include-uncond), and you are in --inference-only mode. if you are using this mode for demo purposes this can be reasonable. but if you are using this mode for purposes of computing FID: you will not want a mixture of cond and uncond samples.')
         if args.sample_n < 1:
             raise ValueError('--inference-only requested but --sample-n is less than 1')
         if (args.inference_n is None) != (args.inference_out_wds_root is None):
@@ -787,10 +785,12 @@ def main():
                 with accelerator.accumulate(model):
                     reals, _, aug_cond = batch[image_key]
                     class_cond, extra_args = None, {}
-                    if precomputed_conds is not None:
+                    if uses_crossattn:
+                        assert precomputed_conds is not None, "cross-attention is currently only implemented for precomputed conditions"
                         xattn_extra_args: CrossAttnExtraArgs = get_precomputed_conds_by_ix(
                             device=accelerator.device,
-                            precomputed_conds=precomputed_conds,
+                            text_uncond_ix=class_captions.uncond_class_ix,
+                            masked_conds=precomputed_conds.masked_conds,
                             embed_ix=batch['embed_ix'],
                             cond_dropout_rate=cond_dropout_rate,
                             allzeros_uncond_rate=dataset_config['allzeros_uncond_rate'],

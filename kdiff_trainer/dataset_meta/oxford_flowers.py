@@ -128,7 +128,7 @@ flower_classes: List[str] = [
 # if HF datasets gives you the index 1, you can lookup ordinal_to_lexical[1] to get 10,
 # then you can lookup flower_classes[10-1] to get 'globe thistle' from Multimodal-Fatima's labels.
 
-ordinal_to_lexical: List[int] = [
+_nelorth_to_fatima_1_indexed: List[int] = [
   1,
   10,
   100,
@@ -232,3 +232,4 @@ ordinal_to_lexical: List[int] = [
   98,
   99,
 ]
+nelorth_to_fatima: List[int] = [ix-1 for ix in _nelorth_to_fatima_1_indexed]

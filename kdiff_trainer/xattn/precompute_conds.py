@@ -8,30 +8,23 @@ from accelerate import Accelerator
 from dataclasses import dataclass
 import gc
 
-# from ..iteration.batched import batched
 from .masked_cond import MaskedCond
 
 @dataclass
 class PrecomputedConds:
-    text_uncond_ix: int
-    class_captions: List[str]
     masked_conds: MaskedCond
     emptystr_masked_uncond: MaskedCond
     allzeros_masked_uncond: MaskedCond
 
 def precompute_conds(
     accelerator: Accelerator,
-    classes_to_captions: str,
+    class_captions: List[str],
+    uncond_class_ix: int,
     encoder: str,
     trust_remote_code = False,
     hf_cache_dir: Optional[str] = None,
 ) -> PrecomputedConds:
-    assert classes_to_captions == 'oxford-flowers'
     from transformers import CLIPTextConfig, AutoConfig, PretrainedConfig
-    from kdiff_trainer.dataset_meta.oxford_flowers import flower_classes
-    text_uncond_ix = 0
-    uncond = ''
-    class_captions: List[str] = [uncond, *flower_classes]
 
     text_model_dtype = torch.bfloat16
 
@@ -119,8 +112,11 @@ def precompute_conds(
             padding=PaddingStrategy.MAX_LENGTH,
             max_length=max_length,
             return_attention_mask=True,
-            return_length=True,
-            add_special_tokens=True,
+            # CLIP learns to pool useful information in EOS because loss is computed on it,
+            # but causal LLMs like Phi learn that nothing meaningful comes after EOS,
+            # so in those cases it won't be useful for us to have hidden states from the EOS position.
+            # note: setting this to True wouldn't make any difference for Phi anyway (doesn't use BOS or EOS).
+            add_special_tokens = encoder == 'clip-vit-l',
         )
         tokens: LongTensor = tokens_out['input_ids'].to(accelerator.device)
         token_mask: LongTensor = tokens_out['attention_mask'].to(accelerator.device, dtype=torch.bool)
@@ -162,8 +158,8 @@ def precompute_conds(
     mask_handle: Work = dist.broadcast(token_mask, 0, async_op=True)
     emb_handle.wait()
     mask_handle.wait()
-    emptystr_uncond: FloatTensor = text_embeds[text_uncond_ix].unsqueeze(0)
-    emptystr_uncond_mask: BoolTensor = token_mask[text_uncond_ix].unsqueeze(0)
+    emptystr_uncond: FloatTensor = text_embeds[uncond_class_ix].unsqueeze(0)
+    emptystr_uncond_mask: BoolTensor = token_mask[uncond_class_ix].unsqueeze(0)
     allzeros_uncond: FloatTensor = torch.zeros_like(emptystr_uncond)
     allzeros_uncond_mask: BoolTensor = torch.ones_like(emptystr_uncond_mask)
 
@@ -185,8 +181,6 @@ def precompute_conds(
     )
 
     return PrecomputedConds(
-        text_uncond_ix=text_uncond_ix,
-        class_captions=class_captions,
         masked_conds=masked_conds,
         emptystr_masked_uncond=emptystr_masked_uncond,
         allzeros_masked_uncond=allzeros_masked_uncond,
