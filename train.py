@@ -213,13 +213,26 @@ def main():
         assert 'demo_uncond' in dataset_config
         assert dataset_config['demo_uncond'] == 'allzeros' or dataset_config['demo_uncond'] == 'emptystr'
 
+    class_captions: Optional[List[str]] = None
+    if 'classes_to_captions' in dataset_config:
+        if dataset_config['classes_to_captions'] == 'oxford-flowers':
+            from kdiff_trainer.dataset_meta.oxford_flowers import flower_classes
+            # TODO: figure out what to do about uncond indexing
+            uncond = ''
+            class_captions: List[str] = [uncond, *flower_classes]
+        elif dataset_config['classes_to_captions'] == 'imagenet-1k':
+            from kdiff_trainer.dataset_meta.imagenet_1k import class_labels
+            class_captions: List[str] = class_labels
+        else:
+            raise ValueError(f"Never heard of classes_to_captions '{dataset_config['classes_to_captions']}'")
+    
     precomputed_conds: Optional[PrecomputedConds] = precompute_conds(
         accelerator=accelerator,
         classes_to_captions=dataset_config['classes_to_captions'],
         encoder=model_config['cross_attn']['encoder'],
         trust_remote_code=args.text_model_trust_remote_code,
         hf_cache_dir=args.text_model_hf_cache_dir,
-    ) if uses_crossattn and 'classes_to_captions' in dataset_config else None
+    ) if uses_crossattn and class_captions is not None else None
 
     if model_config['type'] == 'guided_diffusion':
         from kdiff_trainer.load_diffusion_model import construct_diffusion_model
@@ -597,10 +610,10 @@ def main():
 
         batch: Samples = generate_batch_of_samples()
         if accelerator.is_main_process:
-            if uses_crossattn:
+            if class_captions is not None:
                 assert isinstance(batch, ClassConditionalSamples)
                 pils: List[Image.Image] = to_pil_images(batch.x_0)
-                captions: List[str] = [precomputed_conds.class_captions[caption_ix_.item()] for caption_ix_ in batch.class_cond.flatten().cpu()]
+                captions: List[str] = [class_captions[caption_ix_.item()] for caption_ix_ in batch.class_cond.flatten().cpu()]
                 title = f'[step {step}] {args.name} {args.config}'
                 if args.demo_title_qualifier:
                     title += f' {args.demo_title_qualifier}'

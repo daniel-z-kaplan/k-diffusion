@@ -129,7 +129,7 @@ def precompute_conds(
         with inference_mode():
             if encoder == 'phi-1-5':
                 # for some reason their model code doesn't use flash attn
-                batch_size = 16
+                batch_size = 8
                 layers: Sequential = text_model.layers
                 first, *rest = layers
                 text_embeds: Optional[FloatTensor] = None
