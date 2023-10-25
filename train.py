@@ -5,7 +5,6 @@
 import argparse
 from copy import deepcopy
 from functools import partial
-import importlib.util
 import math
 import json
 from pathlib import Path
@@ -20,20 +19,20 @@ import torch._dynamo
 from torch import distributed as dist
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch import multiprocessing as mp
-from torch import optim, FloatTensor, LongTensor, Tensor
+from torch import optim, FloatTensor, LongTensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils import data
-from torchvision import datasets, transforms, utils
+from torch.utils.data.dataset import Dataset, IterableDataset
+from torchvision import transforms, utils
 from tqdm.auto import tqdm
-from typing import List, Optional, Dict
+from typing import List, Optional, Union
 from PIL import Image
 from dataclasses import dataclass
-from typing import Optional, TypedDict, Generator, Callable, Tuple, Literal
+from typing import Optional, TypedDict, Generator, Callable, Literal
 from contextlib import nullcontext
 from itertools import islice
 from tqdm import tqdm
-from io import BytesIO
 import numpy as np
 
 import k_diffusion as K
@@ -51,6 +50,7 @@ from kdiff_trainer.to_pil_images import to_pil_images
 from kdiff_trainer.tqdm_ctx import tqdm_environ, TqdmOverrides
 from kdiff_trainer.iteration.batched import batched
 from kdiff_trainer.dataset_meta.get_class_captions import get_class_captions, ClassCaptions
+from kdiff_trainer.dataset.get_dataset import get_dataset
 
 SinkOutput = TypedDict('SinkOutput', {
   '__key__': str,
@@ -322,73 +322,13 @@ def main():
         K.augmentation.KarrasAugmentationPipeline(model_config['augment_prob'], disable_all=model_config['augment_prob'] == 0),
     ])
 
-    if dataset_config['type'] == 'imagefolder':
-        train_set = K.utils.FolderOfImages(dataset_config['location'], transform=tf)
-    elif dataset_config['type'] == 'imagefolder-class':
-        train_set = datasets.ImageFolder(dataset_config['location'], transform=tf)
-    elif dataset_config['type'] == 'cifar10':
-        train_set = datasets.CIFAR10(dataset_config['location'], train=True, download=True, transform=tf)
-    elif dataset_config['type'] == 'mnist':
-        train_set = datasets.MNIST(dataset_config['location'], train=True, download=True, transform=tf)
-    elif dataset_config['type'] == 'huggingface':
-        from datasets import load_dataset
-        train_set = load_dataset(dataset_config['location'])
-        ds_transforms: List[DataSetTransform] = []
-        if class_captions is None:
-            if uses_crossattn:
-                def label_extractor(batch: BatchData) -> BatchData:
-                    return { 'label': batch['label'] }
-                ds_transforms.append(label_extractor)
-        else:
-            if class_captions.dataset_label_to_canonical_label is None:
-                def class_ix_extractor(batch: BatchData) -> BatchData:
-                    return { 'class_ix': batch['label'] }
-            else:
-                # TODO: looks like this only works (i.e. pickles) in fork mode, not spawn. probably due to the referencing dataset_label_to_canonical_label.
-                def class_ix_extractor(batch: BatchData) -> BatchData:
-                    labels_nominal: List[int] = batch['label']
-                    labels_canonical: List[int] = [class_captions.dataset_label_to_canonical_label[o] for o in labels_nominal]
-                    return { 'class_ix': labels_canonical }
-            ds_transforms.append(class_ix_extractor)
-        img_augs: DataSetTransform = partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key'])
-        ds_transforms.append(img_augs)
-        multi_transform: DataSetTransform = partial(K.utils.hf_datasets_multi_transform, transforms=ds_transforms)
-        train_set.set_transform(multi_transform)
-        train_set = train_set['train']
-    elif dataset_config['type'] == 'wds' or dataset_config['type'] == 'wds-class':
-        from webdataset import WebDataset
-        def img_from_sample(sample: Dict) -> Tensor:
-            img_bytes: bytes = sample[dataset_config['image_key']]
-            with BytesIO(img_bytes) as stream:
-                img: Image.Image = Image.open(stream)
-                img.load()
-            transformed_tensor: Tensor = tf(img)
-            return transformed_tensor
-        def map_class_cond_wds_sample(sample: Dict) -> Tuple[Image.Image, int]:
-            img: Tensor = img_from_sample(sample)
-            class_cond: int = sample[dataset_config['class_cond_key']]
-            return (img, class_cond)
-        def map_wds_sample(sample: Dict) -> Tuple[Image.Image]:
-            img: Tensor = img_from_sample(sample)
-            return (img,)
-        match dataset_config['type']:
-            case 'wds':
-                mapper = map_wds_sample
-            case 'wds-class':
-                mapper = map_class_cond_wds_sample
-            case _:
-                raise ValueError('')
-        train_set = WebDataset(dataset_config['location']).map(mapper).shuffle(1000)
-    elif dataset_config['type'] == 'custom':
-        location = (Path(args.config).parent / dataset_config['location']).resolve()
-        spec = importlib.util.spec_from_file_location('custom_dataset', location)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        get_dataset = getattr(module, dataset_config.get('get_dataset', 'get_dataset'))
-        custom_dataset_config = dataset_config.get('config', {})
-        train_set = get_dataset(custom_dataset_config, transform=tf)
-    else:
-        raise ValueError('Invalid dataset type')
+    train_set: Union[Dataset, IterableDataset] = get_dataset(
+        dataset_config,
+        config_dir=Path(args.config).parent,
+        uses_crossattn=uses_crossattn,
+        tf=tf,
+        class_captions=class_captions,
+    )
 
     if accelerator.is_main_process:
         try:

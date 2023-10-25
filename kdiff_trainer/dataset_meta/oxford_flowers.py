@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 
 # nelorth provides the full dataset, but labels the classes with numbers.
 # https://huggingface.co/datasets/nelorth/oxford-flowers
@@ -232,4 +232,4 @@ _nelorth_to_fatima_1_indexed: List[int] = [
   98,
   99,
 ]
-nelorth_to_fatima: List[int] = [ix-1 for ix in _nelorth_to_fatima_1_indexed]
+nelorth_to_fatima: Tuple[int, ...] = tuple((ix-1 for ix in _nelorth_to_fatima_1_indexed))
