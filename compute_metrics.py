@@ -1,73 +1,19 @@
 import accelerate
 import argparse
 import k_diffusion as K
-import importlib.util
 from pathlib import Path
 import torch
 from torch import distributed as dist, multiprocessing as mp, Tensor
 from torch.utils import data
-from torchvision import datasets, transforms
-from functools import partial
-from typing import Dict, Optional, Literal, Tuple, List
-from PIL import Image
-from io import BytesIO
+from torchvision import transforms
+from typing import Dict, Optional, Literal, List
 import math
 from tqdm import trange
+from kdiff_trainer.dataset.get_dataset import get_dataset
 
 def ensure_distributed():
     if not dist.is_initialized():
         dist.init_process_group(world_size=1, rank=0, store=dist.HashStore())
-
-def get_train_set(dataset_config: Dict, config_path: str, tf: Optional[transforms.Compose] = None):
-    match dataset_config['type']:
-        case 'imagefolder':
-            train_set = K.utils.FolderOfImages(dataset_config['location'], transform=tf)
-        case 'imagefolder-class':
-            train_set = datasets.ImageFolder(dataset_config['location'], transform=tf)
-        case 'cifar10':
-            train_set = datasets.CIFAR10(dataset_config['location'], train=True, download=True, transform=tf)
-        case 'mnist':
-            train_set = datasets.MNIST(dataset_config['location'], train=True, download=True, transform=tf)
-        case 'huggingface':
-            from datasets import load_dataset
-            train_set = load_dataset(dataset_config['location'])
-            train_set.set_transform(partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key']))
-            train_set = train_set['train']
-        case 'wds' | 'wds-class':
-            from webdataset import WebDataset
-            def img_from_sample(sample: Dict) -> Tensor:
-                img_bytes: bytes = sample[dataset_config['image_key']]
-                with BytesIO(img_bytes) as stream:
-                    img: Image.Image = Image.open(stream)
-                    img.load()
-                transformed_tensor: Tensor = tf(img)
-                return transformed_tensor
-            def map_class_cond_wds_sample(sample: Dict) -> Tuple[Image.Image, int]:
-                img: Tensor = img_from_sample(sample)
-                class_cond: int = sample[dataset_config['class_cond_key']]
-                return (img, class_cond)
-            def map_wds_sample(sample: Dict) -> Tuple[Image.Image]:
-                img: Tensor = img_from_sample(sample)
-                return (img,)
-            match dataset_config['type']:
-                case 'wds':
-                    mapper = map_wds_sample
-                case 'wds-class':
-                    mapper = map_class_cond_wds_sample
-                case _:
-                    raise ValueError('')
-            train_set = WebDataset(dataset_config['location']).map(mapper).shuffle(1000)
-        case 'custom':
-            location = (Path(config_path).parent / dataset_config['location']).resolve()
-            spec = importlib.util.spec_from_file_location('custom_dataset', location)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            get_dataset = getattr(module, dataset_config.get('get_dataset', 'get_dataset'))
-            custom_dataset_config = dataset_config.get('config', {})
-            train_set = get_dataset(custom_dataset_config, transform=tf)
-        case _:
-            raise ValueError(f"Invalid dataset type '{dataset_config['type']}'")
-    return train_set
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
@@ -135,7 +81,13 @@ def main():
     ])
 
     pred_train_set, target_train_set = (
-        get_train_set(dataset_config, config_path, tf=tf) for dataset_config, config_path in (
+        get_dataset(
+            dataset_config,
+            config_dir=Path(config_path).parent,
+            uses_crossattn=False,
+            tf=tf,
+            class_captions=None,
+        ) for dataset_config, config_path in (
             (pred_dataset_config, args.config_pred),
             (target_dataset_config, args.config_target),
         )
