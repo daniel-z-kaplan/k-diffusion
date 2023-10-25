@@ -29,7 +29,7 @@ from tqdm.auto import tqdm
 from typing import List, Optional, Union
 from PIL import Image
 from dataclasses import dataclass
-from typing import Optional, TypedDict, Generator, Callable, Literal
+from typing import Optional, TypedDict, Generator, Callable, Literal, Dict
 from contextlib import nullcontext
 from itertools import islice
 from tqdm import tqdm
@@ -92,6 +92,8 @@ def main():
                    help='compile the model')
     p.add_argument('--config', type=str, required=True,
                    help='the configuration file')
+    p.add_argument('--torchmetrics-fid', action='store_true',
+                   help='whether to use torchmetrics FID (in addition to CleanFID)')
     p.add_argument('--out-root', type=str, default='.',
                    help='outputs (checkpoints, demo samples, state, metrics) will be saved under this directory')
     p.add_argument('--output-to-subdir', action='store_true',
@@ -459,11 +461,31 @@ def main():
         else:
             raise ValueError('Invalid evaluation feature extractor')
         train_iter = iter(train_dl)
+        if args.torchmetrics_fid:
+            if accelerator.is_main_process:
+                from torchmetrics.image.fid import FrechetInceptionDistance
+                # "normalize" means "my images are [0, 1] floats"
+                # https://torchmetrics.readthedocs.io/en/stable/image/frechet_inception_distance.html
+                # we tell it not to obliterate our real features on reset(), because we have no mechanism set up to compute reals again
+                fid_obj = FrechetInceptionDistance(feature=2048, normalize=True, reset_real_features=False)
+                fid_obj.to(accelerator.device)
+            def observe_samples(real: bool, samples: FloatTensor) -> None:
+                accelerator.gather(samples)
+                if accelerator.is_main_process:
+                    fid_obj.update(samples, real=real)
+            observe_samples_real: Callable[[FloatTensor], None] = partial(observe_samples, True)
+            observe_samples_fake: Callable[[FloatTensor], None] = partial(observe_samples, False)
+        else:
+            observe_samples_real: Optional[Callable[[FloatTensor], None]] = None
+            observe_samples_fake: Optional[Callable[[FloatTensor], None]] = None
         if accelerator.is_main_process:
             print('Computing features for reals...')
-        reals_features = K.evaluation.compute_features(accelerator, lambda x: next(train_iter)[image_key][1], extractor, args.evaluate_n, args.batch_size)
+        reals_features = K.evaluation.compute_features(accelerator, lambda x: next(train_iter)[image_key][1], extractor, args.evaluate_n, args.batch_size, observe_samples=observe_samples_real)
         if accelerator.is_main_process and not args.evaluate_only:
-            metrics_log = K.utils.CSVLogger(f'{metrics_root}/{run_qualifier}metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
+            fid_cols: List[str] = ['fid']
+            if args.torchmetrics_fid:
+                fid_cols.append('tfid')
+            metrics_log = K.utils.CSVLogger(f'{metrics_root}/{run_qualifier}metrics.csv', ['step', 'time', 'loss', *fid_cols, 'kid'])
         del train_iter
 
     cfg_scale = 1.
@@ -608,15 +630,26 @@ def main():
                 model_fn = make_cfg_model_fn(model_ema)
             x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=True)
             return x_0
-        fakes_features = K.evaluation.compute_features(accelerator, sample_fn, extractor, args.evaluate_n, args.batch_size)
+        fakes_features = K.evaluation.compute_features(accelerator, sample_fn, extractor, args.evaluate_n, args.batch_size, observe_samples=observe_samples_fake)
         if accelerator.is_main_process:
             fid = K.evaluation.fid(fakes_features, reals_features)
             kid = K.evaluation.kid(fakes_features, reals_features)
-            print(f'FID: {fid.item():g}, KID: {kid.item():g}')
-            if accelerator.is_main_process and metrics_log is not None:
-                metrics_log.write(step, elapsed, ema_stats['loss'], fid.item(), kid.item())
+            cfid: float = fid.item()
+            fid_csv_vals: List[float] = [cfid]
+            fid_wandb_vals: Dict[str, float] = {'FID': cfid}
+            fid_summary = f'FID: {cfid:g}'
+            if args.torchmetrics_fid:
+                tfid: float = fid_obj.compute().item()
+                fid_csv_vals.append(tfid)
+                fid_wandb_vals['tFID'] = tfid
+                fid_summary += f', tFID: {tfid:g}'
+                # this will only reset fake features, because we passed construction param reset_real_features=False
+                fid_obj.reset()
+            print(f'{fid_summary}, KID: {kid.item():g}')
+            if metrics_log is not None:
+                metrics_log.write(step, elapsed, ema_stats['loss'], *fid_csv_vals, kid.item())
             if use_wandb:
-                wandb.log({'FID': fid.item(), 'KID': kid.item()}, step=step)
+                wandb.log({**fid_wandb_vals, 'KID': kid.item()}, step=step)
 
     def save():
         accelerator.wait_for_everyone()

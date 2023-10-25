@@ -3,12 +3,10 @@ import argparse
 import k_diffusion as K
 from pathlib import Path
 import torch
-from torch import distributed as dist, multiprocessing as mp, Tensor
+from torch import distributed as dist, multiprocessing as mp, Tensor, FloatTensor
 from torch.utils import data
 from torchvision import transforms
-from typing import Dict, Optional, Literal, List
-import math
-from tqdm import trange
+from typing import Dict, Optional, Literal, Callable
 from kdiff_trainer.dataset.get_dataset import get_dataset
 
 def ensure_distributed():
@@ -25,7 +23,7 @@ def main():
     p.add_argument('--config-target', type=str, required=True,
                    help='configuration file detailing a dataset of ground-truth examples')
     p.add_argument('--torchmetrics-fid', action='store_true',
-                   help='whether to use torchmetrics FID (as opposed to CleanFID)')
+                   help='whether to use torchmetrics FID (in addition to CleanFID)')
     p.add_argument('--evaluate-n', type=int, default=2000,
                    help='the number of samples to draw to evaluate')
     p.add_argument('--evaluate-with', type=str, default='inception',
@@ -121,6 +119,12 @@ def main():
             # https://torchmetrics.readthedocs.io/en/stable/image/frechet_inception_distance.html
             fid_obj = FrechetInceptionDistance(feature=2048, normalize=True)
             fid_obj.to(accelerator.device)
+        def observe_samples(samples: FloatTensor) -> None:
+            accelerator.gather(samples)
+            if accelerator.is_main_process:
+                fid_obj.update(samples, real=source_name == 'target')
+    else:
+        observe_samples: Optional[Callable[[FloatTensor], None]] = None
     features: Dict[Literal['pred', 'target'], Optional[Tensor]] = { 'pred': None, 'target': None }
     for source_name, iter_ in zip(('pred', 'target'), (pred_train_iter, target_train_iter)):
         print(f'Computing features for {source_name}...')
@@ -128,22 +132,7 @@ def main():
         def sample_fn(_) -> Tensor:
             samp = next(iter_)
             return samp[0]
-        if args.torchmetrics_fid:
-            n_per_proc = math.ceil(args.evaluate_n / accelerator.num_processes)
-            feats_all: List[Tensor] = []
-            try:
-                for i in trange(0, n_per_proc, args.batch_size, disable=not accelerator.is_main_process):
-                    cur_batch_size: int = min(args.evaluate_n - i, args.batch_size)
-                    samples: Tensor = sample_fn(cur_batch_size)[:cur_batch_size]
-                    accelerator.gather(samples)
-                    feats_all.append(accelerator.gather(extractor(samples)))
-                    if accelerator.is_main_process:
-                        fid_obj.update(samples, real=source_name == 'target')
-            except StopIteration:
-                pass
-            features[source_name] = torch.cat(feats_all)[:args.evaluate_n]
-        else:
-            features[source_name] = K.evaluation.compute_features(accelerator, sample_fn, extractor, args.evaluate_n, args.batch_size)
+        features[source_name] = K.evaluation.compute_features(accelerator, sample_fn, extractor, args.evaluate_n, args.batch_size, observe_samples=observe_samples)
     if accelerator.is_main_process:
         if args.torchmetrics_fid:
             fid = fid_obj.compute()
