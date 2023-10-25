@@ -37,6 +37,7 @@
         "type": "huggingface",
         "location": "nelorth/oxford-flowers",
         "image_key": "image",
+        "class_key": "class_ix",
         "classes_to_captions": "oxford-flowers",
         "allzeros_uncond_rate": 1.0,
         "cond_dropout_rate": 0.1,

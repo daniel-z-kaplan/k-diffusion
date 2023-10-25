@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Callable
+from typing import List, Optional
 
 @dataclass
 class ClassCaptions:
@@ -8,7 +8,9 @@ class ClassCaptions:
     # for cross-attn embedding
     embed_class_captions: List[str]
     uncond_class_ix: int
-    dataset_label_to_canonical_label: Optional[Callable[[int], int]]
+    # we deliberately model this mapping as a List rather than a Callable, to make it easier to pickle (it's used in a closure that the dataloader copies to spawned subprocesses)
+    # TODO: looks like that wasn't enough. class_ix_extractor only works in fork mode for now.
+    dataset_label_to_canonical_label: Optional[List[int]]
 
 def get_class_captions(
    classes_to_captions: str,
@@ -16,12 +18,11 @@ def get_class_captions(
     if classes_to_captions == 'oxford-flowers':
         from kdiff_trainer.dataset_meta.oxford_flowers import flower_classes, nelorth_to_fatima
         labels_excl_uncond: List[str] = flower_classes
-        def dataset_label_to_canonical_label(label_nelorth: int) -> int:
-            return nelorth_to_fatima[label_nelorth]
+        dataset_label_to_canonical_label: List[int] = nelorth_to_fatima
     elif classes_to_captions == 'imagenet-1k':
         from kdiff_trainer.dataset_meta.imagenet_1k import class_labels
         labels_excl_uncond: List[str] = class_labels
-        dataset_label_to_canonical_label: Optional[Callable[[int], int]]
+        dataset_label_to_canonical_label: Optional[List[int]] = None
     else:
         raise ValueError(f"Never heard of classes_to_captions '{classes_to_captions}'")
     demo_class_captions: List[str] = [*labels_excl_uncond, '<UNCOND>']
