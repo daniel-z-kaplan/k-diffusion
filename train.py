@@ -260,7 +260,7 @@ def main():
     use_wandb = accelerator.is_main_process and args.wandb_project
     if use_wandb:
         import wandb
-        log_config = vars(args)
+        log_config = vars(deepcopy(args))
         log_config['config'] = config
         log_config['parameters'] = K.utils.n_params((inner_model or inner_model_ema))
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group, config=log_config, save_code=True)
