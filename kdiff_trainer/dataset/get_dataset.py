@@ -23,7 +23,10 @@ class _ImgFromSample:
         with BytesIO(img_bytes) as stream:
             img: Image.Image = Image.open(stream)
             img.load()
-        transformed_tensor: Tensor = self.tf(img)
+        # type depends on what's in the `transforms.Compose`.
+        # if it's KarrasAugmentationPipeline, then:
+        # Tuple[Tensor, Tensor, Tensor]
+        transformed_tensor: Any = self.tf(img)
         return transformed_tensor
 
 @dataclass
@@ -31,15 +34,15 @@ class _MapClassCondWdsSample:
     class_cond_key: str
     img_from_sample: _ImgFromSample
     def __call__(self, sample: Dict) -> Tuple[Image.Image, int]:
-        img: Tensor = self.img_from_sample(sample)
-        class_cond: int = sample[self.class_cond_key]
+        img: Any = self.img_from_sample(sample)
+        class_cond = int(sample[self.class_cond_key])
         return (img, class_cond)
 
 @dataclass
 class _MapWdsSample:
     img_from_sample: _ImgFromSample
     def __call__(self, sample: Dict) -> Tuple[Image.Image]:
-        img: Tensor = self.img_from_sample(sample)
+        img: Any = self.img_from_sample(sample)
         return (img,)
 
 def _label_extractor(batch: BatchData) -> BatchData:
@@ -110,7 +113,7 @@ def get_dataset(
     if dataset_config['type'] == 'wds' or dataset_config['type'] == 'wds-class':
         from webdataset import WebDataset
         img_from_sample = _ImgFromSample(
-            image_key=dataset_config['image_key'],
+            image_key=dataset_config['wds_image_key'],
             tf=tf,
         )
         if dataset_config['type'] == 'wds':

@@ -209,7 +209,7 @@
       "console": "integratedTerminal",
       "justMyCode": true,
       "args": [
-        "--config", "configs/config_guided_diffusion_imagenet.json",
+        "--config", "configs/config_guided_diffusion_imagenet.jsonc",
         // "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
         "--resume-inference", "/p/scratch/ccstdl/birch1/256x256_diffusion.pt",
         "--evaluate-only",
@@ -225,7 +225,7 @@
       "console": "integratedTerminal",
       "justMyCode": true,
       "args": [
-        "--config", "configs/config_guided_diffusion_imagenet.json",
+        "--config", "configs/config_guided_diffusion_imagenet.jsonc",
         // "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
         "--resume-inference", "/p/scratch/ccstdl/birch1/256x256_diffusion.pt",
         "--inference-only",
@@ -241,7 +241,7 @@
       "console": "integratedTerminal",
       "justMyCode": false,
       "args": [
-        "--config", "configs/config_guided_diffusion_imagenet.json",
+        "--config", "configs/config_guided_diffusion_imagenet.jsonc",
         // "--resume-inference", "/nvme1/ml-weights/256x256_diffusion.pt",
         "--resume-inference", "/p/scratch/ccstdl/birch1/256x256_diffusion.pt",
         "--inference-only",

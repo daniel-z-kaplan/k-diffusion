@@ -20,8 +20,13 @@
     "input_size": [256, 256]
   },
   "dataset": {
-    "type": "imagefolder-class",
-    "location": "/nvme1/ml-data/ImageNet/train",
+    // "type": "imagefolder-class",
+    "type": "wds-class",
+    // "location": "/nvme1/ml-data/ImageNet/train",
+    // "location": "/p/scratch/transfernetx/datasets/ImageNet/im-1k/train",
+    "location": "/p/fastdata/mmlaion/imagenet-1K-webdataset/train/{00000..01023}.tar",
+    "wds_image_key": "jpg",
+    "class_cond_key": "cls",
     "num_classes": 1000,
     "classes_to_captions": "imagenet-1k"
   }
