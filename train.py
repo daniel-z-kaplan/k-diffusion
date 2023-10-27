@@ -87,6 +87,8 @@ def main():
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--batch-size', type=int, default=64,
                    help='the batch size')
+    p.add_argument('--cfg-scale', type=float, default=1.,
+                   help='CFG scale used for demo samples and FID evaluation')
     p.add_argument('--checkpointing', action='store_true',
                    help='enable gradient checkpointing')
     p.add_argument('--clip-model', type=str, default='ViT-B/16',
@@ -496,7 +498,6 @@ def main():
             metrics_log = K.utils.CSVLogger(f'{metrics_root}/{run_qualifier}metrics.csv', ['step', 'time', 'loss', *fid_cols, 'kid'])
         del train_iter
 
-    cfg_scale = 1.
     maybe_uncond_class: Literal[1, 0] = 1 if args.demo_classcond_include_uncond else 0
     
     if args.sampler_preset == 'dpm3':
@@ -543,7 +544,7 @@ def main():
             )
             class_cond = cfg_args.caption_ix
             extra_args = {**extra_args, **cfg_args.sampling_extra_args}
-            model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=masked_uncond, cfg_scale=cfg_scale)
+            model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=masked_uncond, cfg_scale=args.cfg_scale)
         elif num_classes:
             class_cond = torch.randint(0, num_classes + maybe_uncond_class, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
             dist.broadcast(class_cond, 0)
@@ -642,7 +643,7 @@ def main():
                     rng=None,
                 )
                 extra_args = {**extra_args, **cfg_args.sampling_extra_args}
-                model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=masked_uncond, cfg_scale=cfg_scale)
+                model_fn = make_cfg_crossattn_model_fn(model_ema, masked_uncond=masked_uncond, cfg_scale=args.cfg_scale)
             elif num_classes:
                 extra_args[class_cond_key] = torch.randint(0, num_classes, [n], device=device)
                 model_fn = make_cfg_model_fn(model_ema)
