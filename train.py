@@ -26,10 +26,10 @@ from torch.utils import data
 from torch.utils.data.dataset import Dataset, IterableDataset
 from torchvision import transforms, utils
 from tqdm.auto import tqdm
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union, Protocol
 from PIL import Image
 from dataclasses import dataclass
-from typing import Optional, TypedDict, Generator, Callable, Literal, Dict
+from typing import Optional, TypedDict, Generator, Callable, Literal, Dict, Any
 from contextlib import nullcontext
 from itertools import islice
 from tqdm import tqdm
@@ -72,6 +72,10 @@ class Sample:
 @dataclass
 class ClassConditionalSample(Sample):
     class_cond: int
+
+class Sampler(Protocol):
+    @staticmethod
+    def __call__(model_fn: Callable, x: FloatTensor, sigmas: FloatTensor, extra_args: Dict[str, Any]) -> Any: ...
 
 def ensure_distributed():
     if not dist.is_initialized():
@@ -144,6 +148,8 @@ def main():
                    help='the inference checkpoint to resume from')
     p.add_argument('--sample-n', type=int, default=64,
                    help='the number of images to sample for demo grids')
+    p.add_argument('--sampler-preset', type=str, default='dpm3', choices=['dpm2', 'dpm3'],
+                   help='whether to use the original DPM++(2M) SDE, sampler_type="heun" eta=0. config or to use DPM++(3M) SDE eta=1., which seems to get lower FID')
     p.add_argument('--save-every', type=int, default=10000,
                    help='save every this many steps')
     p.add_argument('--seed', type=int,
@@ -492,6 +498,15 @@ def main():
 
     cfg_scale = 1.
     maybe_uncond_class: Literal[1, 0] = 1 if args.demo_classcond_include_uncond else 0
+    
+    if args.sampler_preset == 'dpm3':
+        def do_sample(model_fn: Callable, x: FloatTensor, sigmas: FloatTensor, extra_args: Dict[str, Any], disable: bool) -> FloatTensor:
+            return K.sampling.sample_dpmpp_3m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=1.0, disable=disable)
+    elif args.sampler_preset == 'dpm2':
+        def do_sample(model_fn: Callable, x: FloatTensor, sigmas: FloatTensor, extra_args: Dict[str, Any], disable: bool) -> FloatTensor:
+            return K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=disable)
+    else:
+        raise ValueError(f"Unsupported sampler_preset: '{args.sampler_preset}'")
 
     def make_cfg_model_fn(model):
         def cfg_model_fn(x, sigma, class_cond):
@@ -538,7 +553,8 @@ def main():
             extra_args[class_cond_key] = class_cond[accelerator.process_index]
             model_fn = make_cfg_model_fn(model_ema)
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
-        x_0: FloatTensor = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
+
+        x_0: FloatTensor = do_sample(model_fn, x, sigmas, extra_args=extra_args, disable=not accelerator.is_main_process)
         x_0 = accelerator.gather(x_0)[:args.sample_n]
         if class_cond is None:
             return Samples(x_0)
@@ -609,7 +625,7 @@ def main():
         with FSDP.summon_full_params(model_ema):
             pass
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
-        def sample_fn(n):
+        def sample_fn(n: int) -> FloatTensor:
             x = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
             model_fn, extra_args = model_ema, {}
             if uses_crossattn:
@@ -630,7 +646,7 @@ def main():
             elif num_classes:
                 extra_args[class_cond_key] = torch.randint(0, num_classes, [n], device=device)
                 model_fn = make_cfg_model_fn(model_ema)
-            x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=True)
+            x_0: FloatTensor = do_sample(model_fn, x, sigmas, extra_args=extra_args, disable=True)
             return x_0
         fakes_features = K.evaluation.compute_features(accelerator, sample_fn, extractor, args.evaluate_n, args.batch_size, observe_samples=observe_samples_fake)
         if accelerator.is_main_process:
