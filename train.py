@@ -350,6 +350,8 @@ def main():
         opt, train_dl = accelerator.prepare(opt, train_dl)
         if use_wandb:
             wandb.watch(inner_model)
+    else:
+        train_dl = accelerator.prepare(train_dl)
 
     if accelerator.num_processes == 1:
         args.gns = False
