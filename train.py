@@ -343,7 +343,7 @@ def main():
     cond_dropout_rate = dataset_config.get('cond_dropout_rate', 0.1)
     class_key = dataset_config.get('class_key', 1)
 
-    train_dl = data.DataLoader(train_set, args.batch_size, shuffle=True, drop_last=True,
+    train_dl = data.DataLoader(train_set, args.batch_size, shuffle=not isinstance(train_set, data.IterableDataset), drop_last=True,
                                num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
 
     if do_train:
