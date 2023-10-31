@@ -1,6 +1,6 @@
 import k_diffusion as K
 from k_diffusion.utils import DataSetTransform, BatchData
-from typing import Any, TypedDict, NotRequired, Union, Protocol, TypeAlias, Dict, Optional, List, Tuple, Sequence
+from typing import Any, TypedDict, Union, Protocol, TypeAlias, Dict, Optional, List, Tuple, Sequence
 from torch import Tensor
 from torch.utils.data.dataset import Dataset, IterableDataset
 from torchvision import transforms, datasets
@@ -9,8 +9,10 @@ from functools import partial
 from PIL import Image
 from io import BytesIO
 from dataclasses import dataclass
-
+import torch
 from ..dataset_meta.get_class_captions import ClassCaptions
+import io
+
 
 CustomDatasetConfig: TypeAlias = Dict[str, Any]
 
@@ -37,6 +39,19 @@ class _MapClassCondWdsSample:
         img: Any = self.img_from_sample(sample)
         class_cond = int(sample[self.class_cond_key])
         return (img, class_cond)
+    
+@dataclass
+class _MapClassCondWdsSampleLatent:
+    class_cond_key: str
+    image_key : str
+    def __call__(self, sample: Dict) -> Tuple[Image.Image, int]:
+        # print(sample["txt"].decode('utf-8'))
+        stream = io.BytesIO(sample[self.image_key])
+        img: Any = torch.load(stream)
+        class_cond = int(sample[self.class_cond_key].decode("utf-8"))
+        print(img.shape, class_cond)
+        return (img, class_cond)
+
 
 @dataclass
 class _MapWdsSample:
@@ -70,10 +85,10 @@ class GetDataset(Protocol):
 
 class DatasetConfig(TypedDict):
     type: str
-    location: NotRequired[str]
-    image_key: NotRequired[str]
-    class_cond_key: NotRequired[str]
-    get_dataset: NotRequired[GetDataset]
+    location: Any
+    image_key: Any
+    class_cond_key: Any
+    get_dataset: Any
 
 def get_dataset(
     dataset_config: DatasetConfig,
@@ -110,7 +125,7 @@ def get_dataset(
         multi_transform: DataSetTransform = partial(K.utils.hf_datasets_multi_transform, transforms=ds_transforms)
         train_set.set_transform(multi_transform)
         return train_set['train']
-    if dataset_config['type'] == 'wds' or dataset_config['type'] == 'wds-class':
+    if dataset_config['type'] == 'wds' or dataset_config['type'] == 'wds-class' or dataset_config['type'] == 'wds-class-latent':
         from webdataset import WebDataset
         img_from_sample = _ImgFromSample(
             image_key=dataset_config['wds_image_key'],
@@ -122,6 +137,11 @@ def get_dataset(
             mapper = _MapClassCondWdsSample(
                 class_cond_key=dataset_config['class_cond_key'],
                 img_from_sample=img_from_sample,
+            )
+        elif dataset_config['type'] == 'wds-class-latent':
+            mapper = _MapClassCondWdsSampleLatent(
+                class_cond_key=dataset_config['class_cond_key'],
+                image_key=dataset_config["wds_image_key"],
             )
         else:
             raise ValueError('')
